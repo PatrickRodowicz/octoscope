@@ -9,6 +9,12 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / ".cache"
+DB_PATH = PROJECT_ROOT / "octoscope.db"
+
+# Settled half-hourly records are occasionally revised after first publication,
+# so the incremental consumption fetch re-asks for a trailing overlap rather
+# than starting strictly after the newest row already stored.
+CONSUMPTION_OVERLAP_DAYS = 2
 
 REST_BASE = "https://api.octopus.energy/v1"
 GRAPHQL_URL = "https://api.octopus.energy/v1/graphql/"
@@ -27,7 +33,6 @@ GRAPHQL_URL = "https://api.octopus.energy/v1/graphql/"
 #                             ~72/hour, leaving headroom under 125.
 TELEMETRY_BUDGET_PER_HOUR = 110
 POLL_TELEMETRY = 60
-POLL_RATES = 30 * 60
 POLL_CONSUMPTION = 30 * 60
 
 TTL_TELEMETRY_TODAY = 10 * 60
@@ -38,7 +43,6 @@ TTL_BILLS = 6 * 3600
 
 # Cache TTLs (seconds).
 TTL_ACCOUNT = 24 * 3600
-TTL_PRODUCTS = 24 * 3600
 TTL_RATES = 30 * 60
 TTL_CONSUMPTION = 30 * 60
 
@@ -47,21 +51,11 @@ TTL_CONSUMPTION = 30 * 60
 # room to spare, without dragging a large payload back on every poll.
 PROVISIONAL_DAYS = 3
 
-# A "plunge" is a half-hour slot priced at or below zero. Agile publishes
-# tomorrow's rates around 16:00 UK time for the 23:00->23:00 window.
-PLUNGE_THRESHOLD_P = 0.0
-CHEAP_THRESHOLD_P = 5.0
-EXPENSIVE_THRESHOLD_P = 30.0
-
 
 @dataclass(frozen=True)
 class Config:
     api_key: str
     account: str
-
-    @property
-    def basic_auth_user(self) -> str:
-        return self.api_key
 
 
 def load_config() -> Config:

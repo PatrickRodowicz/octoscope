@@ -1,40 +1,37 @@
-"""Tiny TTL'd disk cache.
+"""Tiny TTL'd cache, backed by the `kv` table.
 
-Every API response goes through here. The point is to be a well-behaved
-API citizen: on restart the dashboard repopulates from disk rather than
-re-fetching, and slow-moving data (account, products, historical
-consumption) is only refetched when genuinely stale.
+Every API response still goes through here, and the point is unchanged: be a
+well-behaved API citizen, repopulate from disk on restart rather than
+re-fetching, and only refetch slow-moving data when genuinely stale.
+
+What changed is where it lands. This used to be one JSON file per key under
+`.cache/`, which reached 527 files and 33 MB - largely the same rate records
+written out again and again under overlapping window keys. It is now rows in
+`octoscope.db`. The four functions below keep their old signatures, so no
+caller needed to change.
+
+Telemetry no longer belongs here at all. A cache entry is something you can
+afford to lose because you can ask for it again; Home Mini readings expire at
+source and cannot be. Those go to the `telemetry` table in `db.py` and are
+never deleted - this layer only decides whether an API call is worth making.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import time
-from pathlib import Path
 from typing import Any
 
-from .config import CACHE_DIR
-
-
-def _path_for(key: str) -> Path:
-    digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)[:60]
-    return CACHE_DIR / f"{safe}-{digest}.json"
+from . import db
 
 
 def get(key: str, ttl: float) -> Any | None:
     """Return the cached value for `key`, or None if missing/stale."""
-    path = _path_for(key)
-    if not path.exists():
+    entry = db.kv_get(key)
+    if entry is None:
         return None
-    try:
-        with path.open() as f:
-            envelope = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    value, stored_at = entry
+    if time.time() - stored_at > ttl:
         return None
-    if time.time() - envelope.get("stored_at", 0) > ttl:
-        return None
-    return envelope.get("value")
+    return value
 
 
 def get_stale(key: str) -> Any | None:
@@ -47,21 +44,10 @@ def get_stale(key: str) -> Any | None:
 
 
 def put(key: str, value: Any) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = _path_for(key)
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w") as f:
-        json.dump({"stored_at": time.time(), "value": value}, f)
-    tmp.replace(path)
+    db.kv_put(key, value)
 
 
 def age(key: str) -> float | None:
     """Seconds since `key` was written, or None if absent."""
-    path = _path_for(key)
-    if not path.exists():
-        return None
-    try:
-        with path.open() as f:
-            return time.time() - json.load(f).get("stored_at", 0)
-    except (json.JSONDecodeError, OSError):
-        return None
+    entry = db.kv_get(key)
+    return None if entry is None else time.time() - entry[1]
