@@ -27,8 +27,9 @@ from typing import Any
 
 import httpx
 
-from . import cache
+from . import cache, db
 from .config import (
+    CONSUMPTION_OVERLAP_DAYS,
     GRAPHQL_URL,
     REST_BASE,
     TELEMETRY_BUDGET_PER_HOUR,
@@ -345,17 +346,60 @@ class OctopusClient:
         """Half-hourly settled consumption, oldest first.
 
         Lags real time by roughly a day, so the most recent day is partial.
+
+        Served from the archive, with only the tail refetched. This used to pull
+        the entire history every 30 minutes and rewrite it as one blob - 5,800
+        rows re-read and re-serialised to learn about the couple of dozen that
+        were new, under a cache key carrying `period_to` to the hour, so the
+        window shifted out from under itself and the blob was written afresh
+        each time.
         """
         period_to = period_to or dt.datetime.now(dt.timezone.utc)
-        params = {
-            "period_from": period_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "period_to": period_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "order_by": "period",
-            "page_size": 25000,
-        }
-        path = f"/electricity-meter-points/{point.mpan}/meters/{point.serial}/consumption/"
-        key = f"consumption-{point.serial}-{params['period_from'][:10]}-{params['period_to'][:13]}"
-        return await self._cached(key, TTL_CONSUMPTION, lambda: self._rest_all(path, params))
+        stored = db.consumption_latest(point.mpan, point.serial)
+        since_fetch = cache.age(f"consumption-fetched-{point.serial}")
+
+        # The freshness marker says when the *tail* was last extended, which
+        # says nothing about how far back the archive reaches. If this call
+        # wants history older than anything previously asked for, the marker
+        # must not suppress it. Tracked as the earliest period_from requested
+        # rather than the oldest row held, because those differ permanently
+        # whenever settlement starts later than move-in - as here, where the
+        # meter was replaced and records begin four months after moving in.
+        horizon_key = f"consumption-from-{point.serial}"
+        asked_from = db.parse(cache.get_stale(horizon_key))
+        backfill = asked_from is None or period_from < asked_from
+
+        if backfill or since_fetch is None or since_fetch > TTL_CONSUMPTION:
+            start = period_from
+            if not backfill and stored is not None and stored > period_from:
+                # Re-ask for a trailing overlap: settlement revises recently
+                # published half hours, and a strictly incremental fetch would
+                # keep the first, wrong answer forever.
+                start = max(
+                    period_from, stored - dt.timedelta(days=CONSUMPTION_OVERLAP_DAYS)
+                )
+            params = {
+                "period_from": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "period_to": period_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "order_by": "period",
+                "page_size": 25000,
+            }
+            path = (
+                f"/electricity-meter-points/{point.mpan}/meters/{point.serial}/consumption/"
+            )
+            try:
+                rows = await self._rest_all(path, params)
+            except Exception:
+                # Nothing archived yet means there is nothing to fall back on.
+                if stored is None:
+                    raise
+            else:
+                db.add_consumption(point.mpan, point.serial, rows)
+                cache.put(f"consumption-fetched-{point.serial}", db.iso(period_to))
+                if backfill:
+                    cache.put(horizon_key, db.iso(min(period_from, asked_from or period_from)))
+
+        return db.consumption_slice(point.mpan, point.serial, period_from, period_to)
 
     # ---------------- GraphQL ----------------
 
@@ -564,6 +608,16 @@ class OctopusClient:
             },
         )
         rows = data.get("smartMeterTelemetry") or []
+
+        # Archive before anything else touches the response. Home Mini readings
+        # expire at source - ten-second data within 12 hours - and Octopus holds
+        # the only copy, so a response that reaches the UI without being written
+        # down is not cached data, it is destroyed data. Coverage is recorded
+        # even when `rows` is empty: a range Octopus served nothing for is a
+        # range known to be empty, and re-asking spends budget to learn it twice.
+        db.add_telemetry(device_id, grouping, rows)
+        db.add_coverage(device_id, grouping, start_dt, end_dt)
+
         if cache_ttl is not None and cache_key is not None and rows:
             cache.put(cache_key, rows)
         return rows

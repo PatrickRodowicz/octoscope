@@ -4,10 +4,10 @@ This module used to carry Agile price slots and plunge-window detection. Both
 are gone: the tariff comparison view answers the question plunge alerts were
 standing in for ("would a different tariff be cheaper, and when"), and it does
 it against real consumption rather than a tariff this account is not on.
+
+What is left is the sparkline on the NOW tile.
 """
 from __future__ import annotations
-
-import datetime as dt
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
@@ -45,15 +45,3 @@ def sparkline(values: list[float], width: int | None = None, floor: float | None
         idx = int((v - low) / span * (len(SPARK_CHARS) - 1))
         out.append(SPARK_CHARS[max(0, min(len(SPARK_CHARS) - 1, idx))])
     return "".join(out)
-
-
-def humanise(delta: dt.timedelta) -> str:
-    """'2h 15m' style formatting for a positive timedelta."""
-    total = int(delta.total_seconds())
-    if total < 0:
-        return "now"
-    hours, remainder = divmod(total, 3600)
-    minutes = remainder // 60
-    if hours:
-        return f"{hours}h {minutes:02d}m"
-    return f"{minutes}m"

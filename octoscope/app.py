@@ -11,7 +11,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Label, RichLog
 
-from . import cache, costing
+from . import cache, costing, db, migrate
 from .api import MeterPoint, OctopusClient
 from .config import (
     POLL_CONSUMPTION,
@@ -22,7 +22,9 @@ from .config import (
     load_config,
 )
 from .costing import ROLLUPS, UK, Calibration, DayTotal, RateTimeline
-from .store import TelemetryStore, max_reach
+from .store import TelemetryStore
+from .store import best_source as store_best
+from .store import reach as store_reach
 from .widgets import (
     BillsPane,
     Column,
@@ -164,6 +166,7 @@ class Octoscope(App):
         self.bills: list[dict] = []
         self._telemetry_failed = False
         self._series_lock = asyncio.Lock()
+        self._filling: set[str] = set()
         self._busy: Counter[str] = Counter()
         self._spinner_frame = 0
         self._tariff_options: list[costing.TariffOption] | None = None
@@ -219,11 +222,23 @@ class Octoscope(App):
 
     async def on_mount(self) -> None:
         self.log_line("[dim]octoscope online[/dim]")
+        imported = await asyncio.to_thread(migrate.run_once)
+        if imported:
+            self.log_line(
+                f"[green]imported[/green] {imported['telemetry']} readings and "
+                f"{imported['kv']} cache entries from .cache/"
+            )
+        counts = await asyncio.to_thread(db.stats)
+        self.log_line(
+            f"[dim]archive: {counts['telemetry']} readings, "
+            f"{counts['consumption']} settled half-hours[/dim]"
+        )
         self.set_interval(SPINNER_INTERVAL, self.tick_spinner)
         self.run_worker(self.bootstrap(), exclusive=False)
 
     async def on_unmount(self) -> None:
         await self.client.aclose()
+        db.close()
 
     # ---------------- busy indicator ----------------
 
@@ -572,7 +587,7 @@ class Octoscope(App):
     def render_reconcile(self) -> None:
         """Check the Home Mini's record against settled billing.
 
-        Reads only what is already on disk - the telemetry store plus whatever
+        Reads only what is already on disk - the telemetry archive plus whatever
         provisional buckets this session fetched - so opening the overlay never
         costs an API call. If the two sources happen not to overlap, it says so
         rather than fetching to manufacture an answer.
@@ -582,12 +597,14 @@ class Octoscope(App):
         point = self.point
         if point and point.device_id:
             held = TelemetryStore(point.device_id, "HALF_HOURLY")
-            rows.extend(r for r in held.rows.values() if r.get("readAt") not in seen)
+            rows.extend(r for r in held.all() if r.get("readAt") not in seen)
 
         result = costing.reconcile(self.readings, rows)
+        # Octopus only serves about six days of half-hourly telemetry, but the
+        # archive keeps every day it has ever seen - so this comparison widens
+        # by a day for each day the app is run, rather than sliding.
         reach = (
-            "half-hourly telemetry reaches back about 6 days, so this is the "
-            "whole overlap Octopus will serve"
+            f"{len(result)} days held locally; Octopus itself only serves about six"
         )
         self.query_one("#reconcile", ReconcilePane).update_rows(result, reach)
 
@@ -710,8 +727,17 @@ class Octoscope(App):
                 end = dt.datetime.fromtimestamp(epoch - epoch % seconds, dt.timezone.utc)
                 start = end - dt.timedelta(minutes=minutes)
                 try:
-                    source = await self.load_series(
-                        point.device_id, grouping, start, end, live_now)
+                    # A coarser series is a summary of a finer one, so if the
+                    # archive already holds this window at higher resolution,
+                    # use that instead of asking Octopus for the digest. Costs
+                    # nothing, and resolves demand far better - see
+                    # store.best_source.
+                    finer = store_best(point.device_id, grouping, start, end)
+                    if finer:
+                        source = TelemetryStore(point.device_id, finer).slice(start, end)
+                    else:
+                        source = await self.load_series(
+                            point.device_id, grouping, start, end, live_now)
                 except Exception as exc:  # noqa: BLE001
                     status = str(exc)
 
@@ -742,35 +768,88 @@ class Octoscope(App):
         end: dt.datetime,
         live_now: bool,
     ) -> list[dict]:
-        """Serve a window from the local series, fetching only what is missing.
+        """Serve a window from the archive at once, filling any holes behind it.
 
-        Fetches are serialised. Holding rapid keypresses would otherwise start
-        several overlapping requests, and a cancelled one still costs its slot
-        in the hourly budget while storing nothing - so the next press refetches
-        the very data that was already paid for.
+        Scrolling must not wait on the network. A gap is padded backwards into
+        as much history as one call will carry, which is the right thing for the
+        hourly budget - one request buys eleven hours instead of one bucket -
+        but it means a 90-second hole triggers a 3,600-row, half-megabyte
+        request. Blocking the render on that made scrolling feel broken while
+        the archive it was waiting for already held almost all of the answer.
+
+        So the query returns immediately and the fetch runs in a worker, which
+        re-renders when it lands. Reading is sub-millisecond; only genuinely
+        absent hours ever involve Octopus.
+
+        The archive outlives the API's retention, so a window can legitimately
+        reach back further than Octopus will serve. Those hours are answered
+        from storage rather than asked for and refused.
         """
-        async with self._series_lock:
-            series = TelemetryStore(device_id, grouping)
-            now = dt.datetime.now(dt.timezone.utc)
-            gaps = series.missing(start, end)
-            if live_now and gaps:
-                # The trailing edge is always "missing" because time moves; only
-                # refetch it once the cached tail is genuinely stale.
-                gaps = [g for g in gaps if (g[1] - g[0]) >= dt.timedelta(seconds=90)]
+        series = TelemetryStore(device_id, grouping)
+        now = dt.datetime.now(dt.timezone.utc)
+        gaps = series.missing(start, end)
+        if live_now and gaps:
+            # The trailing edge is always "missing" because time moves; only
+            # refetch it once the stored tail is genuinely stale.
+            gaps = [g for g in gaps if (g[1] - g[0]) >= dt.timedelta(seconds=90)]
 
-            for gap in gaps:
-                fetch_start, fetch_end = series.widen(gap, now)
-                with self.busy("fetching meter history"):
-                    rows = await self.client.telemetry(
-                        device_id, grouping=grouping,
-                        start_at=fetch_start, end_at=fetch_end)
-                series.add(fetch_start, fetch_end, rows)
-                self.log_line(
-                    f"[dim]fetched {grouping.lower()} "
-                    f"{fetch_start.astimezone(UK):%H:%M}-{fetch_end.astimezone(UK):%H:%M}"
-                    f" ({len(rows)} rows, store {series.size})[/dim]"
-                )
-            return series.slice(start, end)
+        # Plus anything covered but empty that the meter may have since
+        # uploaded - see TelemetryStore.stale_empty.
+        plan = sorted(series.fetchable(gaps, now) + series.stale_empty(start, end, now))
+        if plan:
+            self._schedule_fill(device_id, grouping, plan)
+        return series.slice(start, end)
+
+    def _schedule_fill(
+        self, device_id: str, grouping: str,
+        plan: list[tuple[dt.datetime, dt.datetime]],
+    ) -> None:
+        """Queue a background backfill, one per granularity at a time.
+
+        Without the guard every render of a window containing a hole would start
+        another fetch for the same hole - and the 60-second poll re-renders the
+        live view on its own, so a single unfillable gap would spend the entire
+        hourly budget on it.
+        """
+        if grouping in self._filling:
+            return
+        self._filling.add(grouping)
+        self.run_worker(
+            self._fill_gaps(device_id, grouping, plan), group="fill", exclusive=False
+        )
+
+    async def _fill_gaps(
+        self, device_id: str, grouping: str,
+        plan: list[tuple[dt.datetime, dt.datetime]],
+    ) -> None:
+        series = TelemetryStore(device_id, grouping)
+        try:
+            # Serialised: holding rapid keypresses would otherwise start several
+            # overlapping requests, and a cancelled one still costs its slot in
+            # the hourly budget while storing nothing.
+            async with self._series_lock:
+                now = dt.datetime.now(dt.timezone.utc)
+                for gap in plan:
+                    fetch_start, fetch_end = series.widen(gap, now)
+                    with self.busy("filling meter history"):
+                        # Archived by the client as it lands, so nothing here
+                        # has to remember to write it down.
+                        rows = await self.client.telemetry(
+                            device_id, grouping=grouping,
+                            start_at=fetch_start, end_at=fetch_end)
+                    self.log_line(
+                        f"[dim]filled {grouping.lower()} "
+                        f"{fetch_start.astimezone(UK):%H:%M}-{fetch_end.astimezone(UK):%H:%M}"
+                        f" ({len(rows)} rows, archive {series.size})[/dim]"
+                    )
+        except Exception as exc:  # noqa: BLE001 - the view already has what it had
+            self.log_line(f"[yellow]backfill {grouping.lower()}:[/yellow] {exc}")
+        finally:
+            self._filling.discard(grouping)
+        # Redraw with whatever arrived. Safe against looping: the range is now
+        # covered, and add_coverage stamps it as freshly fetched.
+        if self.view == "live":
+            self.run_worker(self.render_live(), group="live")
 
     def render_spikes(self) -> None:
         """Pick bursts out of whatever window the live view is showing."""
@@ -1169,17 +1248,18 @@ class Octoscope(App):
         if self.view != "live":
             return
         _, _, grouping, minutes, _ = LIVE_ROLLUPS[self.live_rollup_index]
-        # Each granularity only exists so far back; scrolling past that would
-        # show an empty chart with no explanation.
-        limit = max(
-            dt.timedelta(0), max_reach(grouping) - dt.timedelta(minutes=minutes)
-        )
+        # Bounded by what can be *shown*, not by what Octopus will still serve.
+        # The archive keeps ten-second data long after the API's 12-hour window
+        # has closed over it, so the limit grows as history accumulates.
+        device_id = self.point.device_id if self.point else ""
+        available = store_reach(device_id, grouping)
+        limit = max(dt.timedelta(0), available - dt.timedelta(minutes=minutes))
         wanted = self.live_offset + delta
         self.live_offset = min(max(dt.timedelta(0), wanted), limit)
         if wanted > limit:
             self.log_line(
-                f"[yellow]{grouping.lower().replace('_', ' ')} data only goes back "
-                f"{int(max_reach(grouping).total_seconds() // 3600)}h[/yellow]"
+                f"[yellow]{grouping.lower().replace('_', ' ')} history goes back "
+                f"{int(available.total_seconds() // 3600)}h[/yellow]"
             )
         # Not exclusive: cancelling a live render would abandon an in-flight
         # telemetry fetch that has already been charged against the budget.

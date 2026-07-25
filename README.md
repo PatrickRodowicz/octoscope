@@ -71,12 +71,37 @@ you can walk back through the day and see what each burst cost.
 `←`/`→` pan by half a window; `shift`+`←`/`→` step one bucket, which is what you
 want when lining the window up on a specific event.
 
-Telemetry is kept in a local time series per granularity (`store.py`) rather
-than cached per window. Each fetch records the range it covered, so a new window
-asks only for the parts not already held, and gaps are padded **backwards** to
-six hours before fetching — scrolling back opens gaps at the leading edge, so
-padding forwards would refetch what is already stored and buy only one new
-bucket. Measured result: **ten single-bucket steps cost zero API calls.**
+Telemetry is kept in a local archive per granularity (`db.py`, planned by
+`store.py`) rather than cached per window. Each fetch records the range it
+covered, so a new window asks only for the parts not already held, and gaps are
+padded **backwards** to six hours before fetching — scrolling back opens gaps at
+the leading edge, so padding forwards would refetch what is already stored and
+buy only one new bucket. Measured result: **ten single-bucket steps cost zero
+API calls.**
+
+Because the archive outlives the API's retention, scrolling is bounded by what
+has been *recorded*, not by what Octopus will still serve — see
+[The archive](#the-archive). Gaps older than the API's reach are dropped from
+the fetch plan rather than requested and refused, since an impossible request
+still costs a slot in the hourly budget.
+
+**Scrolling never waits on the network.** Widening a gap backwards is right for
+the budget — one request buys eleven hours instead of one bucket — but it means
+a 90-second hole triggers a 3,600-row, half-megabyte request. Blocking the
+render on that made scrolling feel broken while the archive it was waiting for
+already held almost all of the answer. The query now returns immediately and the
+fetch runs in a worker that redraws when it lands:
+
+```
+step  1:  110.1 ms   step  5:  107.2 ms   step  9:  109.8 ms
+step  2:  113.0 ms   step  6:  108.8 ms   step 10:  110.4 ms
+step  3:  151.1 ms   step  7:  108.4 ms   step 11:  128.1 ms
+step  4:  110.4 ms   step  8:  109.3 ms   step 12:  133.6 ms
+```
+
+That floor is the terminal event loop settling, not the data: the archive read
+behind it is **0.1 ms** for a 30-minute window. Only genuinely absent hours
+involve Octopus at all.
 
 The headline reading is deliberately independent of the chart. It always shows
 the meter's latest value, so changing granularity or scrolling into history
@@ -399,14 +424,18 @@ another, and the options never finished building at all.
 ```
 octoscope/
   config.py    credentials, poll intervals, cache TTLs
-  cache.py     TTL'd disk cache; every API response goes through it
+  db.py        SQLite: the telemetry archive, settled consumption, kv cache
+  migrate.py   one-shot import of the old .cache/ JSON blobs
+  cache.py     TTL'd cache over db.kv; every API response goes through it
+  store.py     coverage tracking and fetch planning over the archive
   api.py       REST + GraphQL clients, account/meter discovery
   costing.py   calibration, rate timelines, day/night costing, forecasting
-  model.py     Agile price slots, plunge detection, sparklines
+  model.py     the NOW tile's sparkline
   widgets.py   the panes
   app.py       layout, polling schedule, alerting
   app.tcss     green-phosphor styling
 smoketest.py   exercises the API and costing engine without the TUI
+dbtest.py      offline checks on the storage layer, no credentials needed
 ```
 
 ## Where the data comes from
@@ -417,6 +446,173 @@ smoketest.py   exercises the API and costing engine without the TUI
   only route to Home Mini data. The Mini has **no local network API**; it reads
   your meter over Zigbee and pushes to Octopus's cloud, so live data is fetched
   back out rather than read off your LAN.
+
+## The archive
+
+Everything used to live in TTL'd JSON blobs under `.cache/` — 527 files and
+33 MB by the end, largely the same rate records written out again and again
+under overlapping window keys. For reference data that was merely wasteful. For
+telemetry it was **destructive**, because Home Mini readings are only
+retrievable from Octopus for a short window:
+
+| Grouping | Retrievable for |
+| --- | --- |
+| `TEN_SECONDS` | 12 hours |
+| `ONE_MINUTE` | 72 hours |
+| `HALF_HOURLY` | 144 hours (6 days) |
+
+Past those, the data does not exist anywhere else. The Mini has no local API and
+no onboard history, so Octopus holds the only copy and it expires.
+
+The live poll made this concrete. Every 60 seconds it fetched ~180 rows of
+ten-second data, rendered them into the NOW tile, and dropped them — no cache
+key, no store. The `TelemetryStore` was only reached from `load_series`, which
+is skipped entirely in the default view. So the highest-resolution record of the
+house was being destroyed continuously, by the one code path that always runs.
+
+Readings now land in SQLite keyed on `(device_id, grouping, read_at)` and are
+never deleted. **One row per slot** — the key is the instant the meter reported,
+not the moment we happened to pull it, so re-reading the same half hour a
+hundred times stores it once. There is no `pulled_at`; when a slot is fetched
+again the row is overwritten in place.
+
+That matters for the trailing edge in particular, where a window is often
+refetched before the meter has finished reporting it — the later answer is the
+better one and simply replaces the earlier.
+
+Two consequences:
+
+**Archiving happens in the API client, not at the call sites.** Every telemetry
+response is written down before it is returned, so no caller can forget — which
+is precisely the bug that existed. Later readings for the same instant overwrite
+earlier ones, because the trailing edge of a live window is often refetched
+before the meter has finished reporting it.
+
+**Live history is bounded by what was recorded, not by what Octopus will
+serve.** Measured after the migration:
+
+```
+TEN_SECONDS   api    12h   archive   47.2h    15064 rows
+ONE_MINUTE    api    72h   archive   95.1h     5703 rows
+HALF_HOURLY   api   144h   archive  167.4h      335 rows
+```
+
+Reading a 30-minute window from 30 hours ago — 18 hours past the ten-second
+cutoff — returns 161 rows for **zero API calls**. That window is not retrievable
+from Octopus by any means, and it happens to be a solar export period averaging
+−972 W. Before this change it would simply not exist.
+
+### A coarser view is a summary of a finer one
+
+Octopus serves the same hours at three resolutions, and the app used to fetch
+each independently — so scrolling the 30-minute view over hours already held
+second-by-second went to the network for a digest of data sitting on disk.
+
+It no longer does. `aggregate_power` already buckets whatever resolution it is
+handed, so the finer rows are passed straight through and the coarse series is
+never requested. Nothing is synthesised and **no derived row is written to the
+archive**, where it could later be mistaken for something the meter said.
+
+The substitution is only safe because the arithmetic is exact. Summing
+ten-second `consumptionDelta` across 94 complete half hours reproduces Octopus's
+own half-hourly figures to **0.000%**, with total drift of +0.0000% over 15.5
+kWh. Energy is not approximated; it is the same number.
+
+Demand is *better*, not merely equal. The API reports one `demand` value per
+half hour and it is a spot reading, not an average — measured at 357 W for a
+slot whose true mean was 521 W. Since export is detected by testing whether
+average net flow is negative, a spot value can miss an export window outright.
+Over one 12-hour stretch:
+
+```
+TEN_SECONDS   3879 rows  ->  2.074 kWh   exporting buckets: 14
+ONE_MINUTE     720 rows  ->  2.071 kWh   exporting buckets: 14
+HALF_HOURLY     24 rows  ->  2.000 kWh   exporting buckets: 12
+```
+
+The half-hourly series misses two export windows and reads 3.6% low, the latter
+because a window that does not land on half-hour boundaries has to take or drop
+edge buckets whole, while finer data slices exactly where asked.
+
+A finer series is used only when it is genuinely complete: coverage must span
+the window *and* hold at least half the readings its resolution implies. A range
+recorded from an empty response is "covered" while holding nothing, and serving
+that as data would report an hour of real usage as zero.
+
+Result — 32 scroll steps across all four granularities, out to four days back:
+
+```
+rollup 0 (10 SEC · 30 MIN):  worst 156.1 ms   rollup 2 (5 MIN · 6 HR):  worst 129.1 ms
+rollup 1 (1 MIN · 2 HR):     worst 130.5 ms   rollup 3 (30 MIN · 24 HR): worst 128.5 ms
+
+API calls for all 32 steps: 0
+```
+
+### A ten-second feed does not mean 360 rows an hour
+
+Worth knowing before reading a shortfall as data loss. The archive holds ~323
+readings per hour, not the 360 a strict 10-second grid implies. Measured over
+the whole ten-second history — 15,318 readings across 47.4 hours — the intervals
+between consecutive rows are:
+
+```
+10s  x13572        20s  x1744        30s  x1
+```
+
+**Zero gaps longer than 30 seconds.** The series is continuous; the Mini just
+skips a slot now and then, and 323/hour is its real reporting rate. The
+arithmetic closes exactly: 13,572×10s + 1,744×20s ≈ 47.4 hours.
+
+Coverage is recorded even for responses that returned nothing, so a quiet hour
+is not re-requested on every render. But empty is not treated as final. The Mini
+uploads over the internet and can fall behind, so "Octopus has nothing for this
+hour" is a statement about *now*, not about the hour — and taking it as
+permanent would let a single connectivity blip punch a hole in the archive that
+never heals. Each covered range carries the time it was fetched; one that still
+holds no readings is retried after an hour, until it passes out of the API's
+reach and nothing can arrive for it any more.
+
+### What is still a cache
+
+`kv` holds what genuinely is one — account, products, bills, rates, calibration,
+the telemetry budget. The distinction is whether losing it costs anything: a
+cached API response can be fetched again, an expired reading cannot. Settled
+consumption sits in between and gets its own table, fetched incrementally with a
+two-day trailing overlap because settlement revises recently published half
+hours. The full history used to be re-pulled every 30 minutes; the incremental
+fetch asks for three days instead of eight months and serves the other 5,857
+records from disk.
+
+### Migrating the old cache
+
+`python -m octoscope.migrate` runs once automatically on first launch. It
+rescued **20,870 readings** from the old blobs, including ten-second data
+already two days old and therefore already irretrievable.
+
+Recovering the *keys* took some care. The old scheme wrote
+`{sanitised_key[:60]}-{sha256(key)[:16]}.json`, which is lossy twice: characters
+outside `[A-Za-z0-9-_]` became underscores, and anything past 60 characters was
+cut. Every `rates-*` key carries an ISO timestamp, so reversing the filename
+gives a key no lookup will ever ask for — importing those would have put 30 MB
+of unreachable blobs in the database.
+
+The digest settles it without guessing. It was taken over the *original* key, so
+a recovered key that hashes to the same digest **is** the original; anything else
+is discarded and refetched. That kept 25 entries and dropped 443. The one that
+mattered most is `telemetry-budget`: losing it would reset the hourly call count
+to zero while the server's rolling window carried on, and the app would spend an
+allowance it had already used.
+
+The result is 33 MB and 527 files down to a single database. `.cache/` has since
+been deleted, after verifying the import was complete: all 28,358 telemetry rows
+in it were present in the database, with six values differing — and in every one
+of those the database held the *larger* figure. Those were trailing-edge buckets
+captured mid-interval and refetched once the meter had finished reporting them,
+which is exactly what the `(device_id, grouping, read_at)` upsert exists to do.
+The cache held only stale copies of readings the database has better.
+
+`migrate.py` is kept even though it is now inert here. It is the upgrade path
+for any other checkout, and it no-ops safely when there is no `.cache/`.
 
 ## The NOW tile and export
 
@@ -435,8 +631,15 @@ agree, and all three were wrong at once:
 ## Solar export
 
 This property generates. The `demand` field goes **negative** when on-site
-generation exceeds consumption — measured at up to **-1,256 W**, with the import
-register advancing only 3 Wh across 90 minutes of it.
+generation exceeds consumption — measured at up to **-1,927 W**, with the import
+register not advancing at all across two hours of it. That two-hour window is
+646 consecutive ten-second readings, every one of them negative, with
+`consumption` frozen at 1485157 Wh throughout: 0.000 kWh imported is the correct
+answer, not a gap in the data.
+
+(The previous recorded peak was -1,256 W. The larger figure came out of the
+archive — it is the kind of thing that was being thrown away every minute before
+telemetry was kept.)
 
 This matters for how the live trace is drawn. `consumptionDelta` floors at zero,
 so relying on it alone renders export as flat nothing, indistinguishable from an
@@ -514,11 +717,13 @@ covered 3 of 48 half-hours for is not a discrepancy, it is a gap, and reporting
 it as a −90% delta would be a lie. The bar is scaled to 5% full-width, beyond
 which the exact figure stops mattering.
 
-The overlay reads only what is already on disk — the telemetry store plus this
-session's provisional buckets — so opening it **never costs an API call**. Its
-reach is bounded by how far back Octopus serves half-hourly telemetry, about six
-days. If the two sources happen not to overlap, it says so rather than fetching
-to manufacture an answer.
+The overlay reads only what is already on disk — the telemetry archive plus this
+session's provisional buckets — so opening it **never costs an API call**. It
+used to be bounded by how far back Octopus serves half-hourly telemetry, about
+six days; now it is bounded by the archive, so the comparison gains a day for
+each day the app is run instead of sliding forward and forgetting. If the two
+sources happen not to overlap, it says so rather than fetching to manufacture an
+answer.
 
 ## Rate limits — the actual numbers
 
@@ -613,7 +818,19 @@ octopus_api_key=sk_live_...
 account=A-XXXXXXXX
 ```
 
-Both are gitignored, along with `.cache/`.
+Both are gitignored, along with `octoscope.db`.
+
+Storage lives in `octoscope.db` (SQLite, WAL). It is created on first run and
+the old `.cache/` is imported into it once, automatically. Two checks:
+
+```
+.venv/bin/python dbtest.py      # storage layer, offline, no credentials
+.venv/bin/python smoketest.py   # API and costing engine, no TUI
+```
+
+**Back it up.** The telemetry in there cannot be re-fetched once it has aged out
+of Octopus's retention window — unlike everything else in the file, it is not a
+cache, and deleting it loses history permanently.
 
 ## Possible next steps
 
