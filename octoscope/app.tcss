@@ -1,0 +1,166 @@
+/* Green phosphor CRT. Amber-green for day, blue for night, cyan for plunge. */
+
+Screen {
+    background: #050805;
+    color: #00ff41;
+}
+
+#status {
+    height: 1;
+    padding: 0 1;
+    background: #050805;
+    color: #00ff41;
+}
+
+.banner {
+    height: 3;
+    content-align: center middle;
+    background: #002222;
+    border: heavy #00ffff;
+    margin: 0 1;
+}
+
+.banner.hidden {
+    display: none;
+}
+
+.pane {
+    border: round #1f5f2f;
+    background: #050805;
+    padding: 0 1;
+    height: 100%;
+}
+
+.pane-title {
+    color: #00ff41;
+    text-style: bold;
+    height: 1;
+}
+
+/* Heights are sized to each pane's tallest content. Too small and the last
+   line is silently clipped, which is easy to miss. */
+#tiles {
+    height: 8;
+}
+
+/* 6 usage rows + axis + labels + 5 cost rows + cost axis + summary + title,
+   plus one spare for the provisional-data legend when it appears. */
+/* 14 rows of chart plus up to four summary lines: the totals, the visible
+   span when the period is scrollable, the part-recorded note, and the
+   provisional note. Sized for all four so the scroll hint cannot be the one
+   that falls off the bottom. */
+#trend-pane {
+    height: 22;
+}
+
+#table-pane,
+#live-pane {
+    height: 21;
+}
+
+/* Table (header + 9 products) plus the breakdown beneath it. The breakdown
+   needs one row per rate band, so Cosy's three-band timetable is the tallest
+   case; whatever is left over goes to the per-day chart, which adapts. */
+#tariff-pane {
+    height: 30;
+}
+
+/* Fixed, so the breakdown below it gets the remaining rows. */
+#tariffs {
+    height: 10;
+    background: #050805;
+    color: #00ff41;
+}
+
+#tariff-detail {
+    height: 1fr;
+    background: #050805;
+    color: #00ff41;
+}
+
+#live {
+    background: #050805;
+    color: #00ff41;
+    height: 1fr;
+}
+
+.pane.hidden {
+    display: none;
+}
+
+/* The reconcile overlay swaps places with the chart inside the trend pane,
+   which keeps everything below it still - the pane's own height never
+   changes, only which of the two children fills it. */
+#trend.hidden,
+#reconcile.hidden {
+    display: none;
+}
+
+#reconcile {
+    height: 1fr;
+}
+
+#table {
+    background: #050805;
+    color: #00ff41;
+    height: 1fr;
+}
+
+DataTable > .datatable--header {
+    background: #0a1a0a;
+    color: #00ff41;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #1f5f2f;
+    color: #050805;
+}
+
+DataTable > .datatable--odd-row {
+    background: #071007;
+}
+
+#lower {
+    height: 1fr;
+    min-height: 9;
+}
+
+#split-pane {
+    width: 32%;
+}
+
+#compare-pane {
+    width: 30%;
+}
+
+#log-pane,
+#spike-pane {
+    width: 38%;
+}
+
+#spikes {
+    background: #050805;
+    color: #00ff41;
+    height: 1fr;
+}
+
+#log {
+    background: #050805;
+    color: #00ff41;
+    scrollbar-background: #050805;
+    scrollbar-color: #1f5f2f;
+    /* Long lines wrap rather than opening a horizontal scrollbar. */
+    overflow-x: hidden;
+}
+
+Footer {
+    background: #0a1a0a;
+    color: #00ff41;
+}
+
+Footer > .footer--key {
+    background: #1f5f2f;
+    color: #050805;
+    text-style: bold;
+}
