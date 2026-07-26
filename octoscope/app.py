@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Footer, Label, RichLog
 
 from . import cache, costing, db, migrate
@@ -82,6 +83,8 @@ PERIODS: list[tuple[str, dt.timedelta | None]] = [
 GRAINS: list[tuple[str, str, str]] = [
     ("30 MIN", "30min", "half-hour"),
     ("HOUR", "60min", "hour"),
+    ("6 HOUR", "6hr", "6-hour block"),
+    ("12 HOUR", "12hr", "12-hour block"),
     ("DAY", "day", "day"),
     ("WEEK", "week", "week"),
     ("MONTH", "month", "month"),
@@ -131,6 +134,7 @@ class Octoscope(App):
         Binding("shift+right", "nudge(-1)", "step", priority=True),
         Binding("home", "scrub_now", "now", priority=True),
         Binding("g", "grain", "grain", priority=True),
+        Binding("p", "pause", "pause", priority=True),
         Binding("o", "toggle_reconcile", "vs live", priority=True),
         Binding("l", "toggle_log", "log", priority=True),
     ]
@@ -150,7 +154,7 @@ class Octoscope(App):
         self.provisional: list[DayTotal] = []
         self.provisional_readings: list[dict] = []
         self.period_index = 3  # 30 days
-        self.grain_index = 2   # day
+        self.grain_index = GRAINS.index(("DAY", "day", "day"))
         # Settled readings with Home Mini filling anything Octopus has not
         # published. Every chart figure comes from this one series.
         self.pool: list[dict] = []
@@ -164,6 +168,9 @@ class Octoscope(App):
         self.live_readings: list[dict] = []
         self.live_status = ""
         self.bills: list[dict] = []
+        # Suspends every unattended call: the two polls, and the backfills that
+        # scrolling queues. See action_pause.
+        self.paused = False
         self._telemetry_failed = False
         self._series_lock = asyncio.Lock()
         self._filling: set[str] = set()
@@ -269,15 +276,26 @@ class Octoscope(App):
         reflowed every pane below it, so the whole dashboard jumped each time
         any background job started or finished.
         """
-        status = self.query_one("#status", Label)
+        # The spinner timer and any in-flight job can both tick after the
+        # screen has gone during shutdown, and a redraw of a status row that no
+        # longer exists is not worth crashing the teardown over.
+        try:
+            status = self.query_one("#status", Label)
+        except NoMatches:
+            return
+        # Paused shows on every view, not just the live pane: the whole point
+        # is to be able to walk away, and a state you have to go looking for is
+        # one you will forget you left on.
+        held = "[yellow]⏸ paused[/yellow]" if self.paused else ""
         if not self._busy:
             self._spinner_frame = 0
-            status.update("")
+            status.update(held)
             return
         self._spinner_frame += 1
         bar = _sweep(self._spinner_frame)
         jobs = " · ".join(sorted(self._busy))
-        status.update(f"[#00ff41]{bar}[/#00ff41]  [#b8e600]{jobs}[/#b8e600]")
+        line = f"[#00ff41]{bar}[/#00ff41]  [#b8e600]{jobs}[/#b8e600]"
+        status.update(f"{line}  {held}" if held else line)
 
     async def bootstrap(self) -> None:
         with self.busy("finding meter"):
@@ -302,8 +320,49 @@ class Octoscope(App):
                 await step()
         await self.report_limits()
 
-        self.set_interval(POLL_TELEMETRY, self.refresh_telemetry)
-        self.set_interval(POLL_CONSUMPTION, self.refresh_consumption)
+        self.set_interval(POLL_TELEMETRY, self._poll_telemetry)
+        self.set_interval(POLL_CONSUMPTION, self._poll_consumption)
+
+    # ---------------- pause ----------------
+
+    # The timers go through these rather than calling the refreshers directly,
+    # so that `r` still fetches on demand while paused. Pausing is about the
+    # calls you are not there to authorise, not about locking the app.
+    async def _poll_telemetry(self) -> None:
+        if not self.paused:
+            await self.refresh_telemetry()
+
+    async def _poll_consumption(self) -> None:
+        if not self.paused:
+            await self.refresh_consumption()
+
+    def action_pause(self) -> None:
+        """Stop and restart the background polling.
+
+        Telemetry runs at one call a minute, so an afternoon away burns most of
+        the 125/hour budget rendering a screen nobody is reading - and the
+        window that matters is the one you come back to, which gets refetched
+        anyway. Pausing also stops gap backfills, so the archive stays
+        browsable at every granularity without spending anything.
+
+        Resuming polls at once rather than waiting out the interval, since
+        otherwise coming back to a paused screen shows stale figures for up to
+        half an hour with no sign anything is wrong.
+        """
+        self.paused = not self.paused
+        if self.paused:
+            self.log_line(
+                "[yellow]paused[/yellow] - no polling or backfill until p")
+        else:
+            self.log_line("[green]resumed[/green]")
+            self.run_worker(self._resume(), group="resume")
+        self.tick_spinner()
+        if self.view == "live":
+            self.run_worker(self.render_live(), group="live")
+
+    async def _resume(self) -> None:
+        await self.refresh_telemetry()
+        await self.refresh_consumption()
 
     # ---------------- setup ----------------
 
@@ -562,7 +621,7 @@ class Octoscope(App):
         columns = [Column.from_bucket(b, grain) for b in buckets]
         # Flag the bars whose energy came from the meter rather than a bill.
         # Only meaningful per day or finer; a week straddles both sources.
-        if grain in ("30min", "60min", "day"):
+        if grain in costing.SUB_DAY_PERIODS or grain == "day":
             provisional = self.provisional_dates
             for column in columns:
                 if column.start.astimezone(UK).date() in provisional:
@@ -746,11 +805,18 @@ class Octoscope(App):
             readings, self.live_buckets, rate, is_night, self.today, status)
 
         budget = self.client.budget
-        if live_now:
-            position = f"refresh {POLL_TELEMETRY}s"
-        else:
-            end_local = (dt.datetime.now(UK) - self.live_offset)
-            position = f"[yellow]scrolled back to {end_local:%d %b %H:%M}[/yellow] · home=now"
+        # Pause replaces the refresh interval, which is the one thing here that
+        # stops being true - a scroll position still is, so the two combine.
+        bits = []
+        if self.paused:
+            bits.append("[yellow]paused · p to resume[/yellow]")
+        elif live_now:
+            bits.append(f"refresh {POLL_TELEMETRY}s")
+        if not live_now:
+            end_local = dt.datetime.now(UK) - self.live_offset
+            bits.append(
+                f"[yellow]scrolled back to {end_local:%d %b %H:%M}[/yellow] · home=now")
+        position = " · ".join(bits)
         spent = ""
         if budget.used and budget.resets_at:
             spent = f" · frees at {budget.resets_at.astimezone(UK):%H:%M}"
@@ -811,7 +877,7 @@ class Octoscope(App):
         live view on its own, so a single unfillable gap would spend the entire
         hourly budget on it.
         """
-        if grouping in self._filling:
+        if self.paused or grouping in self._filling:
             return
         self._filling.add(grouping)
         self.run_worker(
@@ -1158,6 +1224,8 @@ class Octoscope(App):
     _GRAIN_SPAN = {
         "30min": dt.timedelta(minutes=30),
         "60min": dt.timedelta(hours=1),
+        "6hr": dt.timedelta(hours=6),
+        "12hr": dt.timedelta(hours=12),
         "day": dt.timedelta(days=1),
         "week": dt.timedelta(days=7),
         "month": dt.timedelta(days=30),

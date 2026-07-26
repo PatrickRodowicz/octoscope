@@ -526,8 +526,16 @@ class Bucket:
 
         Measured from the real elapsed time between its bounds, so the clock
         change days come out at 46 and 50 rather than a hardcoded 48.
+
+        Converted to UTC first, and that is the whole trick: both bounds carry
+        the same ZoneInfo object, and subtracting two datetimes that share a
+        tzinfo ignores the offsets and gives the wall-clock difference. Without
+        the conversion this returned the nominal count on exactly the two days
+        it exists to get right, marking a real full day partial and dropping it
+        out of the mean and peak.
         """
-        return int((self.end - self.start).total_seconds() // 1800)
+        span = self.end.astimezone(dt.timezone.utc) - self.start.astimezone(dt.timezone.utc)
+        return int(span.total_seconds() // 1800)
 
     @property
     def tariff(self) -> str:
@@ -552,6 +560,13 @@ ROLLUPS: dict[str, str] = {
 }
 
 
+# Rollup periods shorter than a day. These label their bars with a time rather
+# than a bare date, and are fine-grained enough that "did the home mini supply
+# this?" is a meaningful question about a single bar. Named once here so adding
+# a granularity is one edit rather than several scattered string literals.
+SUB_DAY_PERIODS = frozenset({"5min", "30min", "60min", "6hr", "12hr"})
+
+
 def _bucket_start(when: dt.datetime, period: str) -> dt.datetime:
     local = when.astimezone(UK)
     if period == "5min":
@@ -560,6 +575,10 @@ def _bucket_start(when: dt.datetime, period: str) -> dt.datetime:
         return local.replace(minute=0 if local.minute < 30 else 30, second=0, microsecond=0)
     if period == "60min":
         return local.replace(minute=0, second=0, microsecond=0)
+    if period == "6hr":
+        return local.replace(hour=local.hour // 6 * 6, minute=0, second=0, microsecond=0)
+    if period == "12hr":
+        return local.replace(hour=local.hour // 12 * 12, minute=0, second=0, microsecond=0)
     if period == "day":
         return local.replace(hour=0, minute=0, second=0, microsecond=0)
     if period == "week":
@@ -577,6 +596,14 @@ def _bucket_end(start: dt.datetime, period: str) -> dt.datetime:
         return start + dt.timedelta(minutes=30)
     if period == "60min":
         return start + dt.timedelta(hours=1)
+    # Adding to a tz-aware datetime is wall-clock arithmetic, so a block that
+    # straddles a clock change still ends on a 6- or 12-hour boundary rather
+    # than an hour either side of one. Its true length then falls out of
+    # Bucket.expected_slots, which converts before subtracting.
+    if period == "6hr":
+        return start + dt.timedelta(hours=6)
+    if period == "12hr":
+        return start + dt.timedelta(hours=12)
     if period == "day":
         return start + dt.timedelta(days=1)
     if period == "week":

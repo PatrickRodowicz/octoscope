@@ -17,6 +17,7 @@ and a projected monthly bill.
 | `shift`+`←` `→` | live view: step one bucket at a time |
 | `home` | live view: jump back to now |
 | `r` | force refresh |
+| `p` | pause/resume background polling — see [Stepping away](#stepping-away) |
 | `l` | swap the spikes pane for the event log |
 | `q` | quit |
 
@@ -129,7 +130,20 @@ Two separate axes, and both matter:
 | Key | Controls | Options |
 | --- | --- | --- |
 | `1`–`6` | how much history | 12 hours, 24 hours, 7 days, 30 days, 90 days, all |
-| `g` | how finely it is sliced | 30 min, hour, day, week, month |
+| `g` | how finely it is sliced | 30 min, hour, 6 hour, 12 hour, day, week, month |
+
+**6 hour and 12 hour** exist because the step from HOUR to DAY was a cliff: a
+month at HOUR is 720 bars you have to scroll through, and the same month at DAY
+is 30 bars that have thrown away every trace of when you actually used the
+electricity. The blocks are anchored to local midnight — 00/06/12/18 and
+00/12 — so they line up with days rather than drifting off whatever hour you
+happened to open the app. Note that the 12 hour boundary is midnight/noon, not
+your Economy 7 changeover — the whole night window falls inside the first bar,
+so read the day/night stacking within a bar rather than treating the two bars
+as the two registers.
+
+They cost nothing to add. Settled data is half-hourly, so these are sums of
+records already on disk; no new call fetches them.
 
 A period is a **window ending now**, not a count of complete days — which is
 what makes 12 and 24 hours expressible at all, since the last day is mostly
@@ -150,12 +164,18 @@ is arithmetically identical however it is sliced:
 
 ```
 PERIOD     GRAIN    BARS        kWh    COST £  WHOLE  PART
-ALL        30 MIN   5882   1485.058    444.52   5882     0
-ALL        HOUR     2942   1485.058    444.52   2940     2
-ALL        DAY       125   1485.058    444.52    120     5
-ALL        WEEK       18   1485.058    444.52     15     3
-ALL        MONTH       5   1485.058    444.52      2     3
+ALL        30 MIN   5857   1481.875    443.67   5857     0
+ALL        HOUR     2929   1481.875    443.67   2928     1
+ALL        6 HOUR    491   1481.875    443.67    487     4
+ALL        12 HOUR   247   1481.875    443.67    243     4
+ALL        DAY       125   1481.875    443.67    121     4
+ALL        WEEK       18   1481.875    443.67     15     3
+ALL        MONTH       5   1481.875    443.67      2     3
 ```
+
+Seven grains, one number. That column does not drift by a penny across a
+2,000× change in bar count, and `dbtest.py` asserts it rather than leaving it to
+be eyeballed.
 
 This is not a coincidence to be re-checked by hand; it is the reason the code is
 shaped this way. Totals used to be assembled per grain from whichever buckets
@@ -435,7 +455,8 @@ octoscope/
   app.py       layout, polling schedule, alerting
   app.tcss     green-phosphor styling
 smoketest.py   exercises the API and costing engine without the TUI
-dbtest.py      offline checks on the storage layer, no credentials needed
+dbtest.py      offline checks on the storage layer and the grains
+uitest.py      drives the TUI headless with every API call stubbed and counted
 ```
 
 ## Where the data comes from
@@ -755,6 +776,29 @@ anything else and trips the limit within the hour. The app now budgets for it:
 | Calibration | GraphQL | cached 12 h | ~0 |
 | Settled consumption, rates | REST | cached 30 min | — |
 
+### Stepping away
+
+Sixty calls an hour is a fine rate to pay while you are watching. It is a poor
+one to pay while you are not: an afternoon out spends most of the 125/h budget
+redrawing a screen nobody is reading, and then you come back, scroll, and find
+there is nothing left to fetch with.
+
+`p` pauses. It stops both polls and, just as importantly, stops the gap
+backfills that scrolling queues — so a paused Octoscope is a **pure archive
+browser**. Every granularity, every window the database holds, at no cost. The
+status row keeps `⏸ paused` on screen from whichever view you are in, because a
+state you have to go looking for is one you will forget you left on.
+
+Two deliberate asymmetries:
+
+- **`r` still works while paused**, and does not un-pause. Pausing is about the
+  calls you are not there to authorise, not about locking the app.
+- **Resuming polls immediately** rather than waiting out the interval.
+  Consumption is on a 30-minute timer, so otherwise you would come back to a
+  screen showing figures up to half an hour stale with nothing saying so.
+
+Nothing about pause is persisted; it lasts the session.
+
 ### How much one call returns
 
 Measured against the live API. The ceiling is on **time span**, not row count —
@@ -821,12 +865,15 @@ account=A-XXXXXXXX
 Both are gitignored, along with `octoscope.db`.
 
 Storage lives in `octoscope.db` (SQLite, WAL). It is created on first run and
-the old `.cache/` is imported into it once, automatically. Two checks:
+the old `.cache/` is imported into it once, automatically. Three checks:
 
 ```
-.venv/bin/python dbtest.py      # storage layer, offline, no credentials
+.venv/bin/python dbtest.py      # storage layer and grains, offline, no credentials
+.venv/bin/python uitest.py      # the TUI, offline, every API call stubbed and counted
 .venv/bin/python smoketest.py   # API and costing engine, no TUI
 ```
+
+Only the last one touches the network.
 
 **Back it up.** The telemetry in there cannot be re-fetched once it has aged out
 of Octopus's retention window — unlike everything else in the file, it is not a

@@ -14,7 +14,9 @@ from rich.text import Text
 from textual.widgets import DataTable, Static
 
 from . import costing
-from .costing import UK, Bucket, DayTotal, Forecast, PowerBucket, Spike, TariffDetail
+from .costing import (
+    SUB_DAY_PERIODS, UK, Bucket, DayTotal, Forecast, PowerBucket, Spike, TariffDetail,
+)
 from .model import sparkline
 
 DAY_STYLE = "#b8e600"
@@ -222,7 +224,7 @@ class Column:
     def from_bucket(cls, bucket: Bucket, grain: str) -> "Column":
         local = bucket.start.astimezone(UK)
         midnight = local.hour == 0 and local.minute == 0
-        if grain in ("30min", "60min"):
+        if grain in SUB_DAY_PERIODS:
             # Only midnights get labelled once the bars are narrow, and a
             # column of "00:00" tells you nothing - so midnight carries the
             # date and every other slot carries the time.
@@ -543,7 +545,10 @@ class TrendChart(Static):
 
     def _stamp(self, column: Column) -> str:
         local = column.start.astimezone(UK)
-        if self.unit in ("half-hour", "hour"):
+        # Every sub-day unit is named in hours ("half-hour", "6-hour block"),
+        # and only those need a time of day to be identifiable - a date alone
+        # would name four bars at once on the 6 HOUR grain.
+        if "hour" in self.unit:
             return local.strftime("%d/%m %H:%M")
         return local.strftime("%d/%m")
 

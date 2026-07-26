@@ -1,4 +1,5 @@
-"""Offline checks on the storage layer. No network, no credentials.
+"""Offline checks on the storage layer and the rollup grains. No network, no
+credentials.
 
 Runs against a scratch database so it can never touch the real archive:
 
@@ -10,7 +11,7 @@ import datetime as dt
 import tempfile
 from pathlib import Path
 
-from octoscope import db
+from octoscope import costing, db
 
 failures: list[str] = []
 
@@ -275,6 +276,60 @@ def main() -> None:
     check("backfilled fetched_at defaults to 0", ranges[0][2], 0.0)
     check("version restamped",
           conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+
+    print("\n=== rollup grains ===")
+    # A day of half-hourly readings, 1 kWh each, in high summer so no clock
+    # change muddies the counts.
+    midnight = dt.datetime(2026, 7, 20, 0, 0, tzinfo=costing.UK)
+    settled = [
+        {"interval_start": (midnight + dt.timedelta(minutes=30 * i)).isoformat(),
+         "consumption": 1.0}
+        for i in range(48)
+    ]
+    epoch = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    flat = lambda p: costing.RateTimeline(records=[(epoch, None, p)])  # noqa: E731
+    cal = costing.DEFAULT_CALIBRATION
+
+    def buckets(period: str) -> list[costing.Bucket]:
+        return costing.rollup(settled, period, cal, flat(25.0), flat(12.0), flat(48.0))
+
+    check("6hr splits a day four ways", len(buckets("6hr")), 4)
+    check("12hr splits a day two ways", len(buckets("12hr")), 2)
+    check("6hr blocks start on the quarters",
+          [b.start.astimezone(costing.UK).hour for b in buckets("6hr")], [0, 6, 12, 18])
+    check("12hr blocks start at midnight and noon",
+          [b.start.astimezone(costing.UK).hour for b in buckets("12hr")], [0, 12])
+    check("6hr blocks hold twelve half-hours",
+          [b.slots for b in buckets("6hr")], [12] * 4)
+
+    # The property the whole rollup design rests on: slicing the same readings
+    # more finely must not create or destroy energy or money.
+    every = ["30min", "60min", "6hr", "12hr", "day"]
+    check("energy is the same at every grain",
+          {p: round(sum(b.kwh for b in buckets(p)), 9) for p in every},
+          {p: 48.0 for p in every})
+    check("cost is the same at every grain",
+          len({round(sum(b.total_cost_p for b in buckets(p)), 6) for p in every}), 1)
+    check("standing charge lands once per day, not once per bucket",
+          round(sum(b.standing_p for b in buckets("6hr")), 6), 48.0)
+
+    # Clock changes: the 00:00-06:00 block really is five hours long in March
+    # and seven in October, and expected_slots has to say so or a complete
+    # block gets marked part-recorded and dropped from the mean and peak.
+    def first_block(day: dt.date, period: str) -> costing.Bucket:
+        start = costing._bucket_start(
+            dt.datetime.combine(day, dt.time(0, 15), tzinfo=costing.UK), period)
+        return costing.Bucket(start=start, end=costing._bucket_end(start, period))
+
+    check("spring forward shortens the first 6hr block",
+          first_block(dt.date(2026, 3, 29), "6hr").expected_slots, 10)
+    check("fall back lengthens it",
+          first_block(dt.date(2026, 10, 25), "6hr").expected_slots, 14)
+    check("and the 12hr block with it",
+          [first_block(dt.date(2026, 3, 29), "12hr").expected_slots,
+           first_block(dt.date(2026, 10, 25), "12hr").expected_slots], [22, 26])
+    check("an ordinary day is unaffected",
+          first_block(dt.date(2026, 7, 20), "6hr").expected_slots, 12)
 
     print("\n=== totals ===")
     print(f"        {db.stats()}")
