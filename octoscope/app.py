@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
 from collections import Counter
 from contextlib import contextmanager
 
@@ -171,6 +172,9 @@ class Octoscope(App):
         # Suspends every unattended call: the two polls, and the backfills that
         # scrolling queues. See action_pause.
         self.paused = False
+        # Monotonic deadline of the next telemetry poll, for the live caption's
+        # countdown. None until bootstrap starts the timer.
+        self._next_poll: float | None = None
         self._telemetry_failed = False
         self._series_lock = asyncio.Lock()
         self._filling: set[str] = set()
@@ -322,6 +326,8 @@ class Octoscope(App):
 
         self.set_interval(POLL_TELEMETRY, self._poll_telemetry)
         self.set_interval(POLL_CONSUMPTION, self._poll_consumption)
+        self._next_poll = time.monotonic() + POLL_TELEMETRY
+        self.set_interval(1, self.tick_countdown)
 
     # ---------------- pause ----------------
 
@@ -329,6 +335,10 @@ class Octoscope(App):
     # so that `r` still fetches on demand while paused. Pausing is about the
     # calls you are not there to authorise, not about locking the app.
     async def _poll_telemetry(self) -> None:
+        # Rearmed whether or not it runs: the timer fires on its own cadence
+        # regardless of pause, so the countdown stays honest about when the
+        # next one is due rather than freezing at zero while paused.
+        self._next_poll = time.monotonic() + POLL_TELEMETRY
         if not self.paused:
             await self.refresh_telemetry()
 
@@ -766,7 +776,7 @@ class Octoscope(App):
         is_night = self.calibration.is_night(now_local)
         rate = (self.night_rates if is_night else self.day_rates).at(
             dt.datetime.now(dt.timezone.utc))
-        label, seconds, grouping, minutes, ttl = LIVE_ROLLUPS[self.live_rollup_index]
+        _, seconds, grouping, minutes, _ = LIVE_ROLLUPS[self.live_rollup_index]
 
         live_now = self.live_offset == dt.timedelta(0)
         # Always the live feed, whatever the chart is showing.
@@ -804,14 +814,31 @@ class Octoscope(App):
         self.query_one("#live", LiveView).update_live(
             readings, self.live_buckets, rate, is_night, self.today, status)
 
+        self.render_live_title()
+        self.render_spikes()
+
+    def render_live_title(self) -> None:
+        """Redraw the live pane's caption.
+
+        Split out of render_live because the countdown has to tick once a
+        second and the rest of that method does not - it queries the archive
+        and rebuilds every bucket. This touches one Label.
+        """
+        try:
+            title = self.query_one("#live-title", Label)
+        except NoMatches:  # tearing down
+            return
+        label = LIVE_ROLLUPS[self.live_rollup_index][0]
+        live_now = self.live_offset == dt.timedelta(0)
         budget = self.client.budget
-        # Pause replaces the refresh interval, which is the one thing here that
-        # stops being true - a scroll position still is, so the two combine.
+
+        # Pause replaces the countdown, which is the one thing here that stops
+        # being true - a scroll position still is, so the two combine.
         bits = []
         if self.paused:
             bits.append("[yellow]paused · p to resume[/yellow]")
-        elif live_now:
-            bits.append(f"refresh {POLL_TELEMETRY}s")
+        elif live_now and (left := self._until_next_poll()) is not None:
+            bits.append(f"update in {left}")
         if not live_now:
             end_local = dt.datetime.now(UK) - self.live_offset
             bits.append(
@@ -820,11 +847,30 @@ class Octoscope(App):
         spent = ""
         if budget.used and budget.resets_at:
             spent = f" · frees at {budget.resets_at.astimezone(UK):%H:%M}"
-        self.query_one("#live-title", Label).update(
+        title.update(
             f"┤ LIVE · {label} ├   [dim]1-4 granularity · ←→ scroll · {position} · "
             f"API budget {budget.remaining}/{budget.per_hour}{spent}[/dim]"
         )
-        self.render_spikes()
+
+    def _until_next_poll(self) -> str | None:
+        """Time to the next telemetry poll, or None before one is scheduled.
+
+        Counts down the interval timer rather than time since the last reading
+        landed, because the timer is what actually fetches: `r` and resuming
+        both refresh without moving it, and a countdown that reset on those
+        would promise an update that is not coming.
+        """
+        if self._next_poll is None:
+            return None
+        # Floored, not rounded: rounding up shows a minute that has not
+        # arrived, and a countdown should never overstate what is left.
+        left = max(0, int(self._next_poll - time.monotonic()))
+        return f"{left // 60}:{left % 60:02d}" if left >= 60 else f"{left}s"
+
+    def tick_countdown(self) -> None:
+        """Second hand for the live caption. Nothing else redraws this often."""
+        if self.view == "live" and not self.paused:
+            self.render_live_title()
 
     async def load_series(
         self,

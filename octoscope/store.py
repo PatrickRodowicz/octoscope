@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 
 from . import db
+from .config import POLL_TELEMETRY
 
 # Measured against the live API, per grouping: how much history a single call
 # will actually return, and how far back that granularity exists at all.
@@ -59,6 +60,22 @@ FINEST_FIRST = ("TEN_SECONDS", "ONE_MINUTE", "HALF_HOURLY")
 # paper but nearly empty, which would silently under-report energy.
 MIN_DENSITY = 0.5
 
+# How much of a window's trailing edge may be uncovered and still count as
+# covered. The archive's leading edge is written by the live poll, so it always
+# lags `now` by up to one poll interval - and the live view snaps its window end
+# to the bucket grid, which lands past that edge for part of every minute.
+#
+# Without this, a two-hour window sitting entirely on disk failed `covers` by a
+# few seconds, `best_source` returned None, and the caller fell back to fetching
+# the wanted granularity - which had no recent coverage at all, so a window that
+# needed nothing planned a 72-hour request. Measured live: the 2 HR view fell
+# back while the 6 HR and 24 HR views, whose coarser snapping kept them behind
+# the edge, were served free from the archive.
+#
+# Refetching that sliver is pointless anyway: the trailing edge is the poll's
+# job, and the next poll brings it in a call already being spent.
+TRAILING_TOLERANCE = dt.timedelta(seconds=POLL_TELEMETRY)
+
 
 def max_reach(grouping: str) -> dt.timedelta:
     """How far back this granularity is still fetchable from Octopus."""
@@ -83,6 +100,10 @@ def best_source(
     357 W where the true average over the same slot was 521 W, so a half-hourly
     row can miss an export window that 180 ten-second samples resolve.
 
+    The window's trailing edge is forgiven by TRAILING_TOLERANCE, because no
+    source can hold readings newer than the last poll and refusing over those
+    few seconds sends the caller off to fetch a window it already has.
+
     Returns None when nothing held is complete enough and the caller should
     fetch `wanted` as usual.
     """
@@ -91,7 +112,8 @@ def best_source(
     for grouping in FINEST_FIRST:
         if grouping == wanted:
             break  # nothing finer was usable; no point preferring a coarser one
-        if TelemetryStore(device_id, grouping).covers(start, end):
+        if TelemetryStore(device_id, grouping).covers(
+                start, end, tolerance=TRAILING_TOLERANCE):
             return grouping
     return None
 
@@ -158,19 +180,34 @@ class TelemetryStore:
                 trimmed.append((begin, finish))
         return trimmed
 
-    def covers(self, start: dt.datetime, end: dt.datetime) -> bool:
+    def covers(
+        self, start: dt.datetime, end: dt.datetime,
+        *, tolerance: dt.timedelta = dt.timedelta(0),
+    ) -> bool:
         """Whether this granularity can answer [start, end) without fetching.
 
         Coverage alone is not enough. A range recorded from an empty response is
         "covered" while holding nothing, and serving it as though it were data
         would report an hour of real usage as zero. So the readings have to
         actually be there, at a plausible density for the resolution.
+
+        `tolerance` forgives a gap lying wholly within that much of `end` - see
+        TRAILING_TOLERANCE. Only the trailing edge is forgiven; a hole anywhere
+        else still counts, however small.
         """
-        if end <= start or self.missing(start, end):
+        if end <= start:
+            return False
+        gaps = self.missing(start, end)
+        if tolerance:
+            gaps = [g for g in gaps if g[0] < end - tolerance]
+        if gaps:
             return False
         seconds = GRAIN_SECONDS.get(self.grouping)
         if not seconds:
             return False
+        # Measured over the whole window, tolerated sliver included: it is at
+        # most one poll out of the shortest window offered, far inside the
+        # slack MIN_DENSITY already allows for the Mini's skipped slots.
         expected = (end - start).total_seconds() / seconds
         held = db.telemetry_count_between(self.device_id, self.grouping, start, end)
         return held >= expected * MIN_DENSITY

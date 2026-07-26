@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
 
 from octoscope import api
 from octoscope.app import GRAINS, Octoscope
@@ -105,7 +106,59 @@ async def main() -> int:
         await settle(pilot, 10, lambda: bool(calls.get("telemetry")))
         check("backfill works again", calls.get("telemetry", 0) > 0, True)
 
+        print("\n=== countdown to the next poll ===")
+        # Tab to the live view: chart -> table -> live.
+        while app.view != "live":
+            await pilot.press("tab")
+            await pilot.pause()
+
+        def caption() -> str:
+            return str(app.query_one("#live-title").content)
+
+        app._next_poll = time.monotonic() + 42.5
+        app.tick_countdown()
+        check("counts down in seconds", "update in 42s" in caption(), True)
+
+        app._next_poll = time.monotonic() + 95.5
+        app.tick_countdown()
+        check("and in m:ss past a minute", "update in 1:35" in caption(), True)
+
+        app._next_poll = time.monotonic() - 3
+        app.tick_countdown()
+        check("never goes negative", "update in 0s" in caption(), True)
+
+        app._next_poll = None
+        app.tick_countdown()
+        check("says nothing before a poll is scheduled",
+              "update in" in caption(), False)
+
+        app._next_poll = time.monotonic() + 30
+        await pilot.press("p")
+        await pilot.pause()
+        check("pause replaces the countdown", "update in" in caption(), False)
+        check("and says why", "paused" in caption(), True)
+        app.tick_countdown()
+        check("ticking while paused does not bring it back",
+              "update in" in caption(), False)
+        await pilot.press("p")
+        await settle(pilot, 20, lambda: "update in" in caption())
+        check("resuming brings it back", "update in" in caption(), True)
+
+        # The timer rearms even while paused, so the countdown never sits at
+        # zero waiting for a poll that already came and went.
+        app.paused = True
+        before = app._next_poll
+        await app._poll_telemetry()
+        check("the deadline moves whether or not the poll ran",
+              app._next_poll > before, True)
+        app.paused = False
+
         print("\n=== chart grains ===")
+        # Back to the chart: `1`-`6` mean the live granularity on the live view.
+        while app.view != "chart":
+            await pilot.press("tab")
+            await pilot.pause()
+        check("on the chart view", app.view, "chart")
         seen = []
         for _ in range(len(GRAINS)):
             await pilot.press("g")

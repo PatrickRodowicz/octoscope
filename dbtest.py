@@ -222,6 +222,38 @@ def main() -> None:
     check("sparse data is not substituted",
           best_source("d7", "HALF_HOURLY", base, base + hours(1)), None)
 
+    print("\n=== the trailing edge is forgiven, holes are not ===")
+    from octoscope.store import TRAILING_TOLERANCE
+
+    # The live view snaps its window end to the bucket grid, which lands past
+    # the archive's edge - written by the last poll - for part of every minute.
+    # Refusing over that sliver sent the caller off to fetch a window it
+    # already held, at whatever granularity had no recent coverage at all.
+    edge = base + hours(1)
+    short = TRAILING_TOLERANCE / 2
+    check("a sliver past the edge is not covered without tolerance",
+          store5.covers(base, edge + short), False)
+    check("but is with it",
+          store5.covers(base, edge + short, tolerance=TRAILING_TOLERANCE), True)
+    check("a shortfall wider than the tolerance still is not",
+          store5.covers(base, edge + TRAILING_TOLERANCE * 2,
+                        tolerance=TRAILING_TOLERANCE), False)
+    check("best_source substitutes across the edge rather than fetching",
+          best_source("d5", "ONE_MINUTE", base, edge + short), "TEN_SECONDS")
+
+    # Only the trailing edge. A hole in the middle is real missing data, and
+    # forgiving it would silently draw an outage as zero usage.
+    db.add_telemetry("d8", "TEN_SECONDS", fine[:180] + fine[240:])
+    db.add_coverage("d8", "TEN_SECONDS", base, base + dt.timedelta(minutes=30))
+    db.add_coverage("d8", "TEN_SECONDS", base + dt.timedelta(minutes=40), edge)
+    store8 = TelemetryStore("d8", "TEN_SECONDS")
+    check("an interior hole is not forgiven",
+          store8.covers(base, edge, tolerance=TRAILING_TOLERANCE), False)
+    check("nor substituted for",
+          best_source("d8", "ONE_MINUTE", base, edge), None)
+    check("tolerance of zero is the old behaviour",
+          store5.covers(base, edge + short, tolerance=dt.timedelta(0)), False)
+
     print("\n=== reach ===")
     from octoscope.store import max_reach, reach
 
@@ -330,6 +362,43 @@ def main() -> None:
            first_block(dt.date(2026, 10, 25), "12hr").expected_slots], [22, 26])
     check("an ordinary day is unaffected",
           first_block(dt.date(2026, 7, 20), "6hr").expected_slots, 12)
+
+    print("\n=== an empty response is still cached ===")
+    import asyncio
+
+    from octoscope.api import OctopusClient
+    from octoscope.config import Config
+
+    client = OctopusClient(Config(api_key="not-used", account="not-used"))
+    sent: list[str] = []
+
+    async def fake_graphql(query, variables):
+        sent.append(variables["s"])
+        return {"smartMeterTelemetry": fake_graphql.rows}
+    fake_graphql.rows = []
+    client._graphql = fake_graphql
+
+    async def fetch(key):
+        return await client.telemetry(
+            "dq", minutes=30, grouping="HALF_HOURLY", cache_ttl=600, cache_key=key)
+
+    # The Mini has gone quiet. Before this fix nothing was written to the cache
+    # on an empty response, so every poll re-asked - the today-totals call
+    # going from 6/hour to one per poll exactly when the budget matters most.
+    check("empty response returns nothing", asyncio.run(fetch("quiet")), [])
+    spent = client.budget.used
+    check("a second call is served from cache", asyncio.run(fetch("quiet")), [])
+    check("and costs no request", len(sent), 1)
+    check("nor a budget slot", client.budget.used, spent)
+
+    # A non-empty response must still cache, and a different key must still ask.
+    fake_graphql.rows = [{"readAt": T0.isoformat(), "consumptionDelta": "5.0",
+                          "demand": "100", "consumption": "1", "costDelta": "0.1"}]
+    check("a real response is returned", len(asyncio.run(fetch("loud"))), 1)
+    check("a new key costs a request", len(sent), 2)
+    check("and is cached too", len(asyncio.run(fetch("loud"))), 1)
+    check("still one request for it", len(sent), 2)
+    asyncio.run(client.aclose())
 
     print("\n=== totals ===")
     print(f"        {db.stats()}")

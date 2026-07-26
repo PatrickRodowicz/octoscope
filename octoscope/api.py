@@ -618,7 +618,14 @@ class OctopusClient:
         db.add_telemetry(device_id, grouping, rows)
         db.add_coverage(device_id, grouping, start_dt, end_dt)
 
-        if cache_ttl is not None and cache_key is not None and rows:
+        # Empty responses are cached too. Skipping them meant that whenever the
+        # Mini went quiet the cached calls stopped being cached and fired on
+        # every poll instead - the today-totals call going from 6/hour to one
+        # per poll, precisely when the budget most needs conserving. The cost
+        # is up to `cache_ttl` before a recovery shows in the derived figures;
+        # the uncached live feed notices immediately either way, and the
+        # archive - not this cache - is what durably records the empty range.
+        if cache_ttl is not None and cache_key is not None:
             cache.put(cache_key, rows)
         return rows
 

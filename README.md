@@ -31,8 +31,9 @@ independently, and the chart scrolls.
 
 **LIVE** — current draw as a large readout, cost per hour at that draw, and a
 power trace with a real clock axis. Keys `1`–`4` change granularity and window
-together: 10 sec/30 min · 1 min/2 hr · 5 min/6 hr · 30 min/24 hr. Shows how much
-telemetry budget is left this hour.
+together: 10 sec/30 min · 1 min/2 hr · 5 min/6 hr · 30 min/24 hr. The caption
+counts down to the next poll (`update in 34s`) and shows how much telemetry
+budget is left this hour.
 
 **TARIFFS** — your actual consumption priced on every comparable Octopus tariff
 over the selected period, cheapest first, including standing charges. Move the
@@ -604,6 +605,48 @@ hours. The full history used to be re-pulled every 30 minutes; the incremental
 fetch asks for three days instead of eight months and serves the other 5,857
 records from disk.
 
+An **empty response is cached too**. Skipping it looks right — why record that
+Octopus had nothing? — but it meant that the moment the Mini went quiet, every
+cached call stopped being cached and fired on each poll instead: today's totals
+going from 6/hour to 60/hour exactly when the budget most needed conserving. The
+durable record of an empty range is the archive's `coverage` row, which has its
+own hour-long retry; this cache is only a rate limiter, and it should limit
+hardest when things are failing. The cost is up to one TTL before a recovery
+shows in the derived figures, and the uncached live feed notices immediately
+regardless.
+
+### The trailing edge
+
+The live view snaps its window end to the bucket grid, while the archive's
+leading edge is written by the poll and so lags `now` by up to one interval. For
+part of every minute the former sits past the latter, and a window held entirely
+on disk failed its coverage test by a few seconds.
+
+The consequence was out of all proportion to the cause. `best_source` returned
+None, the caller fell through to fetching the *wanted* granularity — which had
+no recent coverage at all — and `widen` padded the resulting gap to a full
+72-hour `ONE_MINUTE` request. Because `load_series` only filters trailing gaps
+under 90 seconds, that fired about every other poll:
+
+```
+a 95-second trailing gap on ONE_MINUTE widens to a 72-hour request
+-> about 30 calls/hour while sitting on the 1 MIN · 2 HR view
+```
+
+Measured across one poll cycle, second by second, against the real archive:
+
+```
+before:  8 of 183 renders would fetch   {'1 MIN · 2 HR': 8}
+after :  0 of 183 renders would fetch   {}
+```
+
+The fix is `TRAILING_TOLERANCE` — one poll interval of slack, applied only to
+the end of the window. A hole anywhere else still counts however small, because
+forgiving one would draw a real outage as zero usage. Refetching the sliver was
+never useful anyway: the trailing edge is the poll's job, and the next poll
+brings it in a call already being spent. Beyond the tolerance the fallback
+returns, which is correct — an archive two minutes stale means a poll was missed.
+
 ### Migrating the old cache
 
 `python -m octoscope.migrate` runs once automatically on first launch. It
@@ -798,6 +841,13 @@ Two deliberate asymmetries:
   screen showing figures up to half an hour stale with nothing saying so.
 
 Nothing about pause is persisted; it lasts the session.
+
+The live caption counts down to the next poll — `update in 34s` — so the state
+is legible either way: either you can see when the next call is coming, or you
+can see that none is. The countdown tracks the interval timer rather than time
+since the last reading landed, because the timer is what actually fetches: `r`
+and resuming both refresh without moving it, and a countdown that reset on
+those would be promising an update that is not coming.
 
 ### How much one call returns
 
