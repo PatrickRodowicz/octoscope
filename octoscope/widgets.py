@@ -55,6 +55,10 @@ def _money(pence: float) -> str:
     return f"£{pence / 100:,.2f}"
 
 
+def _signed_money(pence: float) -> str:
+    return f"{'-' if pence < 0 else '+'}{_money(abs(pence))}"
+
+
 class StatTile(Static):
     """A single headline figure with supporting lines beneath."""
 
@@ -551,6 +555,298 @@ class TrendChart(Static):
         if "hour" in self.unit:
             return local.strftime("%d/%m %H:%M")
         return local.strftime("%d/%m")
+
+
+class ComparePane(Static):
+    """One period against the one before it - today vs yesterday, and so on.
+
+    Two things are being asked at once and they need different answers. "Am I
+    up or down?" is only meaningful like for like, so the headline compares the
+    period in progress against the previous one measured to the same point in
+    itself. "Where did it go?" is a question about shape, so the chart draws the
+    whole of both: the current period as bars, the previous one as a level line
+    across them. Reading where each bar sits against its line is the comparison
+    - a bar poking above the line is an hour, or a day, that cost more than its
+    counterpart did.
+    """
+
+    CHART_ROWS = 7
+    GUTTER = 6
+    # Wide enough for the longest label the frames produce - "WEEK OF 21 JUL in
+    # full" - because a truncated one reads as a different period entirely.
+    LABEL_W = 24
+    KWH_W = 12
+    COST_W = 11
+
+    # Per frame: the axis label for one sub-bucket, and what to call one.
+    AXIS: dict[str, tuple[str, str]] = {
+        "day": ("%H", "hour"),
+        "week": ("%a", "day"),
+        "month": ("%d", "day"),
+        "year": ("%b", "month"),
+    }
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.comparison: costing.Comparison | None = None
+        self.metric = "kwh"
+
+    def update_comparison(self, comparison: costing.Comparison, metric: str = "kwh") -> None:
+        self.comparison = comparison
+        self.metric = metric
+        self.refresh_content()
+
+    def on_resize(self) -> None:
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        comparison = self.comparison
+        if comparison is None:
+            self.update(Text("  no data yet", style=DIM))
+            return
+        current, previous = comparison.current, comparison.previous
+        if current.empty and previous.empty:
+            self.update(Text(
+                f"  nothing recorded for {current.label.lower()} "
+                f"or {previous.label.lower()}", style=DIM))
+            return
+
+        lines = self._headline(comparison)
+        lines.append(Text(""))
+        lines.extend(self._chart(comparison))
+        self.update(Group(*lines))
+
+    # ---------------- the numbers ----------------
+
+    def _row(
+        self,
+        label: str,
+        kwh: str,
+        cost: str,
+        note: str = "",
+        *,
+        label_style: str = DIM,
+        kwh_style: str = DAY_STYLE,
+        cost_style: str = COST_STYLE,
+    ) -> Text:
+        """One line of the comparison, with the two figures column-aligned."""
+        line = Text()
+        line.append(label.ljust(self.LABEL_W)[: self.LABEL_W], style=label_style)
+        line.append(kwh.rjust(self.KWH_W), style=kwh_style)
+        line.append(cost.rjust(self.COST_W), style=cost_style)
+        if note:
+            line.append(f"   {note}", style=DIM)
+        return line
+
+    def _headline(self, comparison: costing.Comparison) -> list[Text]:
+        current, previous = comparison.current, comparison.previous
+        baseline = comparison.baseline
+        rows = [
+            self._row(
+                current.label,
+                f"{current.kwh:.2f} kWh", _money(current.cost_p),
+                self._progress(comparison),
+                label_style=f"bold {GREEN}",
+            ),
+            self._row(
+                previous.label,
+                f"{baseline.kwh:.2f} kWh", _money(baseline.cost_p),
+                "to the same point" if comparison.running else "",
+                label_style=GREEN,
+            ),
+        ]
+
+        # A period the archive simply does not cover is not a change in usage,
+        # and reporting it as one - "-100%" - would be a lie either way round.
+        if baseline.empty:
+            point = " by this point" if comparison.running and not previous.empty else ""
+            rows.append(Text(
+                f"  nothing recorded for {previous.label.lower()}{point} "
+                f"to compare against", style=DIM))
+            return rows
+        if current.empty:
+            rows.append(Text(
+                f"  nothing recorded for {current.label.lower()} - an absence, "
+                f"not a drop", style=DIM))
+            return rows
+
+        kwh_delta = comparison.delta("kwh")
+        cost_delta = comparison.delta("cost")
+        # Using less than last time is the good direction, so the colour is the
+        # verdict rather than the sign.
+        style = RED if kwh_delta > 0 else GREEN
+        pct = comparison.delta_pct(self.metric)
+        rows.append(self._row(
+            "CHANGE",
+            f"{kwh_delta:+.2f} kWh", _signed_money(cost_delta),
+            f"{pct:+.1f}% by {'cost' if self.metric == 'cost' else 'kWh'}"
+            if pct is not None else "",
+            label_style=f"bold {style}", kwh_style=style,
+            cost_style=RED if cost_delta > 0 else GREEN,
+        ))
+
+        # Where the previous period finished, so a day that is running ahead of
+        # a quiet morning but behind a busy evening is not read as settled.
+        if comparison.running and not previous.empty:
+            rows.append(self._row(
+                f"{previous.label} in full",
+                f"{previous.kwh:.2f} kWh", _money(previous.cost_p),
+                label_style=DIM, kwh_style=DIM, cost_style=DIM,
+            ))
+
+        swing = comparison.swing(self.metric)
+        if swing is not None and swing[1]:
+            moment, change = swing
+            noun = self.AXIS[comparison.frame][1]
+            amount = (
+                _signed_money(change) if self.metric == "cost" else f"{change:+.2f} kWh")
+            rows.append(Text.assemble(
+                ("  biggest ", DIM), (noun, DIM), (" apart  ", DIM),
+                (self._stamp(moment, comparison.frame), CYAN),
+                ("  ", DIM), (amount, RED if change > 0 else GREEN),
+            ))
+        return rows
+
+    def _progress(self, comparison: costing.Comparison) -> str:
+        """How far into the period we are, in the period's own units.
+
+        A day says how long it has been running; anything longer counts its
+        sub-buckets, because "5132h14m in" is not a fact anyone can use and
+        "month 8 of 12" is the same fact in a form you can act on.
+        """
+        if not comparison.running:
+            return ""
+        if comparison.frame == "day":
+            return f"so far · {_duration(comparison.now - comparison.current.start)} in"
+        starts = comparison.current.starts
+        done = sum(1 for moment in starts if moment <= comparison.now)
+        return f"so far · {self.AXIS[comparison.frame][1]} {done} of {len(starts)}"
+
+    def _stamp(self, moment: dt.datetime, frame: str) -> str:
+        local = moment.astimezone(UK)
+        if frame == "day":
+            return local.strftime("%H:%M")
+        if frame == "year":
+            return local.strftime("%b")
+        return local.strftime("%a %d %b")
+
+    # ---------------- the shape ----------------
+
+    def _chart(self, comparison: costing.Comparison) -> list[Text]:
+        current = comparison.current.values(self.metric)
+        # The two periods can hold different numbers of buckets - a 31-day month
+        # against a 30-day one, or either side of a clock change - so the
+        # previous series is padded to the current grid rather than zipped
+        # against it, which would silently drop the last bar.
+        previous = list(comparison.previous.values(self.metric))[: len(current)]
+        previous += [None] * (len(current) - len(previous))
+
+        seen = [v for v in (*current, *previous) if v is not None]
+        peak = max(seen) if seen else 0.0
+        if not current or peak <= 0:
+            return [Text("  nothing recorded in either period", style=DIM)]
+
+        # Room for the gutter and for the unit written after the axis, which
+        # wraps onto a line of its own if the bars are allowed to reach it.
+        available = max(20, self.size.width - self.GUTTER - 7)
+        widths = _column_widths(len(current), available)
+        levels = self.CHART_ROWS * 8
+
+        lines: list[Text] = []
+        for row in range(self.CHART_ROWS - 1, -1, -1):
+            labelled = row % 2 == 1 or row == self.CHART_ROWS - 1
+            line = self._gutter((row + 1) / self.CHART_ROWS * peak, peak, labelled)
+            for value, before, width in zip(current, previous, widths):
+                filled = int((value or 0.0) / peak * levels)
+                cell = filled - row * 8
+                char = "█" if cell >= 8 else (_LOWER_BLOCKS[cell] if cell > 0 else " ")
+                style = DAY_STYLE
+                # The previous period's level, drawn straight over the bar where
+                # it falls inside one. A line crossing a bar is the whole point:
+                # it says how much of this bucket is the difference.
+                mark = int((before or 0.0) / peak * levels)
+                if before is not None and mark > 0 and (mark - 1) // 8 == row:
+                    char, style = "─", CYAN
+                line.append(char * width, style=style)
+            lines.append(line)
+
+        lines.append(self._axis(widths, peak))
+        lines.append(self._labels(comparison, widths))
+        lines.append(self._legend(comparison))
+        return lines
+
+    def _gutter(self, value: float, peak: float, labelled: bool) -> Text:
+        if not labelled:
+            line = Text(" " * (self.GUTTER - 1))
+            line.append("│", style=DIM)
+            return line
+        line = Text(self._tick(value, peak), style=DIM)
+        line.append("┤", style=DIM)
+        return line
+
+    def _tick(self, value: float, peak: float) -> str:
+        """An axis figure that fits the gutter whatever the scale.
+
+        A year of months runs to hundreds of kWh where a day of hours runs to
+        fractions, and a fixed two decimals overflows the gutter on the one
+        while saying nothing on the other - so the precision follows the peak.
+        """
+        if self.metric == "cost":
+            value, peak = value / 100, peak / 100
+        if peak >= 10_000:
+            text = f"{value / 1000:,.0f}k"
+        elif peak >= 100:
+            text = f"{value:,.0f}"
+        elif peak >= 10:
+            text = f"{value:,.1f}"
+        else:
+            text = f"{value:,.2f}"
+        return text.rjust(self.GUTTER - 1)[-(self.GUTTER - 1):]
+
+    def _axis(self, widths: list[int], peak: float) -> Text:
+        axis = Text(self._tick(0.0, peak), style=DIM)
+        axis.append("└", style=DIM)
+        axis.append("─" * sum(widths), style=DIM)
+        axis.append("  £" if self.metric == "cost" else "  kWh", style=DIM)
+        return axis
+
+    def _labels(self, comparison: costing.Comparison, widths: list[int]) -> Text:
+        """Time of day, weekday, date or month under the bars, as the frame needs.
+
+        Every bucket gets a label if one fits; otherwise they are thinned evenly
+        until they do, so the axis never has two labels running into each other.
+        """
+        fmt = self.AXIS[comparison.frame][0]
+        starts = comparison.current.starts
+        if not starts:
+            return Text("")
+        need = len(starts[0].astimezone(UK).strftime(fmt)) + 1
+        average = max(1, sum(widths) // len(widths))
+        step = max(1, -(-need // average))
+
+        labels = Text(" " * self.GUTTER)
+        cursor = 0
+        column = 0
+        for index, (moment, width) in enumerate(zip(starts, widths)):
+            if index % step == 0 and column >= cursor:
+                text = moment.astimezone(UK).strftime(fmt)
+                labels.append(" " * (column - cursor))
+                labels.append(text, style=DIM)
+                cursor = column + len(text)
+            column += width
+        return labels
+
+    def _legend(self, comparison: costing.Comparison) -> Text:
+        legend = Text("  ")
+        legend.append("█ ", style=DAY_STYLE)
+        legend.append(f"{comparison.current.label.lower()}", style=DIM)
+        legend.append("    ─── ", style=CYAN)
+        noun = self.AXIS[comparison.frame][1]
+        legend.append(f"{comparison.previous.label.lower()}, {noun} by {noun}",
+                      style=DIM)
+        if comparison.previous.empty:
+            legend.append("  (no data)", style=DIM)
+        return legend
 
 
 class ReconcilePane(Static):
@@ -1158,10 +1454,6 @@ class TariffBreakdown(Static):
         return line
 
     @staticmethod
-    def _signed_money(pence: float) -> str:
-        return f"{'-' if pence < 0 else '+'}{_money(abs(pence))}"
-
-    @staticmethod
     def _delta_style(delta: float) -> str:
         return CYAN if delta < 0 else RED
 
@@ -1232,20 +1524,20 @@ class TariffBreakdown(Static):
         lines.append(self._row(
             f"usage {detail.kwh:,.0f} kWh",
             _money(detail.current_usage_p), _money(detail.usage_p),
-            self._signed_money(detail.usage_delta_p),
+            _signed_money(detail.usage_delta_p),
             diff_style=self._delta_style(detail.usage_delta_p), money=True,
         ))
         lines.append(self._row(
             f"standing {len(days)}d",
             _money(detail.current_standing_p), _money(detail.standing_p),
-            self._signed_money(detail.standing_delta_p),
+            _signed_money(detail.standing_delta_p),
             diff_style=self._delta_style(detail.standing_delta_p), money=True,
         ))
         lines.append(self._row(
             "TOTAL",
             _money(detail.current_usage_p + detail.current_standing_p),
             _money(detail.usage_p + detail.standing_p),
-            self._signed_money(detail.total_delta_p),
+            _signed_money(detail.total_delta_p),
             diff_style=f"bold {self._delta_style(detail.total_delta_p)}",
             bold=True, value_style=f"bold {COST_STYLE}", money=True,
         ))
@@ -1260,10 +1552,10 @@ class TariffBreakdown(Static):
                     ("per day".ljust(self.LABEL_W), DIM),
                     (f"cheaper on {detail.cheaper_days} of {len(days)} days   ", CYAN),
                     ("best ", DIM),
-                    (f"{best.date:%d/%m} {self._signed_money(best.delta_p)}   ",
+                    (f"{best.date:%d/%m} {_signed_money(best.delta_p)}   ",
                      self._delta_style(best.delta_p)),
                     ("worst ", DIM),
-                    (f"{worst.date:%d/%m} {self._signed_money(worst.delta_p)}",
+                    (f"{worst.date:%d/%m} {_signed_money(worst.delta_p)}",
                      self._delta_style(worst.delta_p)),
                 )
             )
@@ -1331,7 +1623,7 @@ class TariffBreakdown(Static):
         """Left gutter: a money label on the outermost row, else just the axis."""
         if value is None:
             return "│".rjust(self.GUTTER)
-        return f"{self._signed_money(value)} ┤".rjust(self.GUTTER)
+        return f"{_signed_money(value)} ┤".rjust(self.GUTTER)
 
 
 class SpikeTable(DataTable):

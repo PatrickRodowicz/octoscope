@@ -586,6 +586,8 @@ def _bucket_start(when: dt.datetime, period: str) -> dt.datetime:
         return midnight - dt.timedelta(days=midnight.weekday())
     if period == "month":
         return local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if period == "year":
+        return local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     raise ValueError(f"unknown rollup period: {period}")
 
 
@@ -608,6 +610,8 @@ def _bucket_end(start: dt.datetime, period: str) -> dt.datetime:
         return start + dt.timedelta(days=1)
     if period == "week":
         return start + dt.timedelta(days=7)
+    if period == "year":
+        return start.replace(year=start.year + 1)
     # Months vary in length, so step by day-of-month rather than a fixed delta.
     return (start.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
 
@@ -732,6 +736,277 @@ def patch_today(
             )
         )
     return buckets
+
+
+# ---------------- period comparison ----------------
+
+# Each comparison frame, and the grain its two periods are drawn at. A day is
+# read hour by hour and a year month by month, so that the two periods being
+# compared always hold the same kind of sub-bucket in the same order - which is
+# what makes overlaying them mean anything.
+COMPARE_GRAINS: dict[str, str] = {
+    "day": "60min",
+    "week": "day",
+    "month": "day",
+    "year": "month",
+}
+
+_PERIOD_CURRENT = {
+    "day": "TODAY", "week": "THIS WEEK", "month": "THIS MONTH", "year": "THIS YEAR",
+}
+_PERIOD_PREVIOUS = {
+    "day": "YESTERDAY", "week": "LAST WEEK", "month": "LAST MONTH", "year": "LAST YEAR",
+}
+# How to name a period once it is further back than "last".
+_PERIOD_FORMAT = {"day": "%a %d %b", "week": "week of %d %b", "month": "%b %Y", "year": "%Y"}
+
+
+@dataclass
+class PeriodStat:
+    """One period's usage, both as a total and bucket by bucket.
+
+    `series` is one entry per sub-bucket of the period, in order, with None for
+    buckets nothing was recorded in. None rather than zero because the two are
+    genuinely different: the hours of today that have not happened yet are not
+    hours in which the house used nothing, and drawing them as zero would make
+    every day look like it collapsed at the current time.
+    """
+
+    label: str
+    start: dt.datetime
+    end: dt.datetime
+    grain: str
+    kwh: float = 0.0
+    day_kwh: float = 0.0
+    night_kwh: float = 0.0
+    cost_p: float = 0.0
+    starts: list[dt.datetime] = field(default_factory=list)
+    series: list[float | None] = field(default_factory=list)
+    cost_series: list[float | None] = field(default_factory=list)
+
+    def values(self, metric: str) -> list[float | None]:
+        return self.cost_series if metric == "cost" else self.series
+
+    def total(self, metric: str) -> float:
+        return self.cost_p if metric == "cost" else self.kwh
+
+    @property
+    def recorded(self) -> int:
+        return sum(1 for value in self.series if value is not None)
+
+    @property
+    def empty(self) -> bool:
+        return self.recorded == 0
+
+
+@dataclass
+class Comparison:
+    """Two adjacent periods of the same length, lined up against each other."""
+
+    frame: str
+    grain: str
+    current: PeriodStat
+    previous: PeriodStat
+    # The previous period measured only as far into itself as the current one
+    # has got. None once the current period is over and the full totals are
+    # already like for like.
+    previous_to_date: PeriodStat | None
+    now: dt.datetime
+    cutoff: dt.datetime | None
+
+    @property
+    def running(self) -> bool:
+        """Is the current period still in progress?"""
+        return self.previous_to_date is not None
+
+    @property
+    def baseline(self) -> PeriodStat:
+        """Whichever previous figure the current one can fairly be judged against."""
+        return self.previous_to_date or self.previous
+
+    def delta(self, metric: str) -> float:
+        return self.current.total(metric) - self.baseline.total(metric)
+
+    def delta_pct(self, metric: str) -> float | None:
+        before = self.baseline.total(metric)
+        return self.delta(metric) / before * 100 if before > 0 else None
+
+    def swing(self, metric: str) -> tuple[dt.datetime, float] | None:
+        """The sub-bucket that moved most, so the change has somewhere to point.
+
+        Only buckets both periods recorded, and only ones that have finished: a
+        bucket the previous period is simply missing has not changed, it is
+        unknown, and the hour in progress is short by however much of it is
+        still to come - which would name it the biggest change most of the day.
+        """
+        mine = self.current.values(metric)
+        theirs = self.previous.values(metric)
+        finished = len(self.current.starts)
+        if self.running:
+            finished = sum(1 for m in self.current.starts if m <= self.now) - 1
+        best: tuple[dt.datetime, float] | None = None
+        for index, moment in enumerate(self.current.starts[:max(0, finished)]):
+            if index >= len(theirs):
+                break
+            here, there = mine[index], theirs[index]
+            if here is None or there is None:
+                continue
+            change = here - there
+            if best is None or abs(change) > abs(best[1]):
+                best = (moment, change)
+        return best
+
+
+def period_window(
+    frame: str, offset: int = 0, now: dt.datetime | None = None
+) -> tuple[dt.datetime, dt.datetime]:
+    """Bounds of the frame's period, `offset` whole periods back from now."""
+    now = (now or dt.datetime.now(UK)).astimezone(UK)
+    start = _step_back(_bucket_start(now, frame), frame, offset)
+    return start, _bucket_end(start, frame)
+
+
+def _step_back(start: dt.datetime, frame: str, count: int) -> dt.datetime:
+    """`count` whole periods earlier than `start`.
+
+    Walks back a second from each boundary and re-buckets rather than
+    subtracting a fixed span, so months of different lengths and the weeks
+    containing a clock change all land on real period starts.
+    """
+    for _ in range(count):
+        start = _bucket_start(start - dt.timedelta(seconds=1), frame)
+    return start
+
+
+# Grains whose buckets are a fixed length of real time, however the clock is
+# behaving. Days and up are not: those are wall-clock periods, and a local day
+# is 23 or 25 hours long twice a year on purpose.
+_FIXED_GRAIN_SECONDS = {"5min": 300, "30min": 1800, "60min": 3600}
+
+
+def _bucket_grid(start: dt.datetime, end: dt.datetime, grain: str) -> list[dt.datetime]:
+    """Every bucket start between `start` and `end`, at `grain`.
+
+    Hourly and finer grids step in elapsed time rather than by adding to the
+    local clock, because on the two clock-change days those are different
+    things. Adding an hour to the wall clock across the autumn change walks
+    straight over the repeated hour - so its readings would have no column to
+    land in and would silently vanish from the totals - and across the spring
+    one it names the same instant twice.
+    """
+    seconds = _FIXED_GRAIN_SECONDS.get(grain)
+    grid: list[dt.datetime] = []
+    cursor = start
+    while cursor < end:
+        grid.append(_bucket_start(cursor, grain))
+        if seconds is None:
+            cursor = _bucket_end(cursor, grain)
+        else:
+            cursor = cursor.astimezone(dt.timezone.utc) + dt.timedelta(seconds=seconds)
+    return grid
+
+
+def period_name(frame: str, start: dt.datetime, now: dt.datetime) -> str:
+    """`TODAY`, `LAST WEEK`, or a date once it is further back than that."""
+    current = _bucket_start(now, frame)
+    if start == current:
+        return _PERIOD_CURRENT[frame]
+    if start == _step_back(current, frame, 1):
+        return _PERIOD_PREVIOUS[frame]
+    return start.astimezone(UK).strftime(_PERIOD_FORMAT[frame]).upper()
+
+
+def period_stat(
+    readings: list[dict],
+    start: dt.datetime,
+    end: dt.datetime,
+    grain: str,
+    calibration: Calibration,
+    day_rates: RateTimeline,
+    night_rates: RateTimeline,
+    standing: RateTimeline | None = None,
+    label: str = "",
+) -> PeriodStat:
+    """Total and per-bucket usage for one window of the reading pool.
+
+    Positions each bucket on the period's own grid rather than just listing the
+    buckets that had data, so index 3 means the same thing - the fourth hour,
+    the fourth day - in both periods of a comparison even when one of them has
+    a gap in the middle.
+    """
+    window = [
+        reading for reading in readings
+        if (when := _parse(reading.get("interval_start"))) is not None
+        and start <= when < end
+    ]
+    grid = _bucket_grid(start, end, grain)
+    stat = PeriodStat(
+        label=label, start=start, end=end, grain=grain, starts=grid,
+        series=[None] * len(grid), cost_series=[None] * len(grid),
+    )
+    position = {moment: index for index, moment in enumerate(grid)}
+    for bucket in rollup(
+        window, grain, calibration, day_rates, night_rates, standing
+    ):
+        index = position.get(bucket.start)
+        if index is None:
+            continue
+        stat.series[index] = bucket.kwh
+        stat.cost_series[index] = bucket.total_cost_p
+        stat.kwh += bucket.kwh
+        stat.day_kwh += bucket.day_kwh
+        stat.night_kwh += bucket.night_kwh
+        stat.cost_p += bucket.total_cost_p
+    return stat
+
+
+def compare_periods(
+    readings: list[dict],
+    frame: str,
+    calibration: Calibration,
+    day_rates: RateTimeline,
+    night_rates: RateTimeline,
+    standing: RateTimeline | None = None,
+    *,
+    offset: int = 0,
+    now: dt.datetime | None = None,
+) -> Comparison:
+    """This day/week/month/year against the one before it.
+
+    The comparison anyone actually wants is like for like: the period in
+    progress has only got so far into itself, and holding a Tuesday morning up
+    against a whole Monday reports a collapse in usage every morning. So while
+    the current period is running, the previous one is also measured to the
+    same point, and that is what the headline change is computed from - with
+    its full total kept alongside, since where the day is heading matters too.
+    """
+    now = (now or dt.datetime.now(UK)).astimezone(UK)
+    grain = COMPARE_GRAINS[frame]
+    current_start, current_end = period_window(frame, offset, now)
+    previous_start = _step_back(current_start, frame, 1)
+
+    def stat(start: dt.datetime, end: dt.datetime, label: str) -> PeriodStat:
+        return period_stat(
+            readings, start, end, grain, calibration, day_rates, night_rates,
+            standing, label)
+
+    current = stat(
+        current_start, current_end, period_name(frame, current_start, now))
+    previous = stat(
+        previous_start, current_start, period_name(frame, previous_start, now))
+
+    to_date: PeriodStat | None = None
+    cutoff: dt.datetime | None = None
+    if current_start <= now < current_end:
+        # Wall-clock arithmetic, so "as far in as we are now" means the same
+        # time of day rather than the same number of elapsed seconds - which
+        # would land an hour out either side of a clock change.
+        cutoff = min(previous_start + (now - current_start), current_start)
+        to_date = stat(previous_start, cutoff, previous.label)
+    return Comparison(
+        frame=frame, grain=grain, current=current, previous=previous,
+        previous_to_date=to_date, now=now, cutoff=cutoff,
+    )
 
 
 @dataclass

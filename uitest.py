@@ -14,7 +14,7 @@ import datetime as dt
 import time
 
 from octoscope import api
-from octoscope.app import GRAINS, Octoscope
+from octoscope.app import COMPARE_FRAMES, GRAINS, Octoscope
 
 calls: dict[str, int] = {}
 failures: list[str] = []
@@ -183,6 +183,62 @@ async def main() -> int:
         await pilot.pause()
         check("12 HOURS refines a 6 HOUR chart to HOUR",
               GRAINS[app.grain_index][0], "HOUR")
+
+        print("\n=== comparing periods ===")
+        # Every figure here comes out of the reading pool already in memory, so
+        # the whole view - including stepping back through history - must cost
+        # nothing on the wire.
+        calls.clear()
+        while app.view != "compare":
+            await pilot.press("tab")
+            await pilot.pause()
+        check("tab reaches the compare view", app.view, "compare")
+
+        def heading() -> str:
+            return str(app.query_one("#compare-title").content)
+
+        check("it opens on today vs yesterday",
+              "TODAY vs YESTERDAY" in heading(), True)
+        for key, frame in (("2", "WEEK"), ("3", "MONTH"), ("4", "YEAR")):
+            await pilot.press(key)
+            await pilot.pause()
+            check(f"{key} selects the {frame.lower()} frame",
+                  COMPARE_FRAMES[app.frame_index][0], frame)
+        check("and says which two periods it is showing",
+              "THIS YEAR vs LAST YEAR" in heading(), True)
+
+        await pilot.press("g")
+        await pilot.pause()
+        check("g plots cost instead of kWh", app.compare_metric, "cost")
+        check("and the hint says how to get back", "g kWh" in heading(), True)
+        await pilot.press("g")
+        await pilot.pause()
+        check("and back again", app.compare_metric, "kwh")
+
+        await pilot.press("1")
+        await pilot.pause()
+        await pilot.press("left")
+        await pilot.pause()
+        check("← steps back a whole period", app.compare_offset, 1)
+        check("which moves both halves along",
+              "YESTERDAY vs SAT" in heading() or "YESTERDAY vs" in heading(), True)
+        await pilot.press("2")
+        await pilot.pause()
+        check("changing frame returns to the period in progress",
+              app.compare_offset, 0)
+
+        await pilot.press("left")
+        await pilot.press("left")
+        await pilot.pause()
+        check("and it keeps stepping", app.compare_offset, 2)
+        await pilot.press("home")
+        await pilot.pause()
+        check("home comes back to now", app.compare_offset, 0)
+        await pilot.press("right")
+        await pilot.pause()
+        check("right at the present stays put", app.compare_offset, 0)
+
+        check("none of it called out", sum(calls.values()), 0)
 
     if failures:
         print(f"\n{len(failures)} FAILURES")

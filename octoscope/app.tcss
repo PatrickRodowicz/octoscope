@@ -58,6 +58,19 @@ Screen {
     height: 21;
 }
 
+/* Title, up to five lines of figures, a blank, then 7 chart rows plus axis,
+   labels and legend. Sized for the tallest case - a running period, which adds
+   the previous period's full total - so nothing is clipped mid-comparison. */
+#compare-pane {
+    height: 20;
+}
+
+#compare {
+    height: 1fr;
+    background: #050805;
+    color: #00ff41;
+}
+
 /* Table (header + 9 products) plus the breakdown beneath it. The breakdown
    needs one row per rate band, so Cosy's three-band timetable is the tallest
    case; whatever is left over goes to the per-day chart, which adapts. */
@@ -130,7 +143,7 @@ DataTable > .datatable--odd-row {
     width: 32%;
 }
 
-#compare-pane {
+#bills-pane {
     width: 30%;
 }
 

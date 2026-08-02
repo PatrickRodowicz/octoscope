@@ -30,6 +30,7 @@ from .store import reach as store_reach
 from .widgets import (
     BillsPane,
     Column,
+    ComparePane,
     ForecastTile,
     LiveView,
     MonthTile,
@@ -101,12 +102,25 @@ LIVE_ROLLUPS: list[tuple[str, int, str, int, int]] = [
     ("30 MIN · 24 HR", 1800, "HALF_HOURLY", 1440, 900),
 ]
 
+# Comparison frames, selectable with the number keys in the compare view: the
+# label, and the calendar period it steps over. Calendar periods rather than
+# rolling windows, because "this month vs last month" is the question people
+# actually ask - and the two halves of a rolling window share a boundary that
+# moves under them every time you look.
+COMPARE_FRAMES: list[tuple[str, str]] = [
+    ("DAY", "day"),
+    ("WEEK", "week"),
+    ("MONTH", "month"),
+    ("YEAR", "year"),
+]
+
 # Tab cycles through these: view name, the pane it shows, and the widget that
 # should take focus so the arrow keys act on what you are looking at. Views
 # whose content is not navigable take focus away from the previous table, so a
 # stray keypress cannot move a cursor that is no longer on screen.
 VIEWS: list[tuple[str, str, str | None]] = [
     ("chart", "trend-pane", None),
+    ("compare", "compare-pane", None),
     ("table", "table-pane", "table"),
     ("live", "live-pane", None),
     ("tariffs", "tariff-pane", "tariffs"),
@@ -163,6 +177,9 @@ class Octoscope(App):
         self.reconciling = False
         self.rollup_index = 3  # day
         self.view_index = 0
+        self.frame_index = 0      # compare view: day vs day
+        self.compare_offset = 0   # whole frames back from the period in progress
+        self.compare_metric = "kwh"
         self.live_rollup_index = 0
         self.live_offset = dt.timedelta(0)
         self.live_buckets: list[costing.PowerBucket] = []
@@ -206,6 +223,9 @@ class Octoscope(App):
             yield Label("┤ USAGE & SPEND ├", classes="pane-title", id="trend-title")
             yield TrendChart(id="trend")
             yield ReconcilePane(id="reconcile", classes="hidden")
+        with Vertical(classes="pane hidden", id="compare-pane"):
+            yield Label("┤ COMPARE ├", classes="pane-title", id="compare-title")
+            yield ComparePane(id="compare")
         with Vertical(classes="pane hidden", id="table-pane"):
             yield Label("┤ ROLLUP ├", classes="pane-title", id="table-title")
             yield RollupTable(id="table")
@@ -220,7 +240,7 @@ class Octoscope(App):
             with Vertical(classes="pane", id="split-pane"):
                 yield Label("┤ DAY vs NIGHT ├", classes="pane-title")
                 yield SplitPane(id="split")
-            with Vertical(classes="pane", id="compare-pane"):
+            with Vertical(classes="pane", id="bills-pane"):
                 yield Label("┤ BILLS vs COMPUTED ├", classes="pane-title")
                 yield BillsPane(id="bills")
             with Vertical(classes="pane", id="spike-pane"):
@@ -606,6 +626,9 @@ class Octoscope(App):
         self.render_month()
         if self.reconciling:
             self.render_reconcile()
+        if self.view == "compare":
+            # Same pool, so a poll that moves the chart moves this too.
+            self.render_compare()
 
     def _columns(self, span: dt.timedelta | None, grain: str) -> list[Column]:
         """Bucket the merged reading pool for `span` at `grain`.
@@ -652,6 +675,50 @@ class Octoscope(App):
         cutoff = (dt.datetime.now(UK) - span).date()
         window = [t for t in complete if t.date >= cutoff]
         return window or complete[-1:]
+
+    def render_compare(self) -> None:
+        """Draw the selected period against the one before it.
+
+        Reads the same merged pool the chart does, so the two views can never
+        disagree about what a day used, and costs nothing in API calls however
+        far back you step.
+        """
+        frame = COMPARE_FRAMES[self.frame_index][1]
+        comparison = costing.compare_periods(
+            self.pool, frame, self.calibration, self.day_rates, self.night_rates,
+            self.standing, offset=self.compare_offset)
+        self.query_one("#compare", ComparePane).update_comparison(
+            comparison, self.compare_metric)
+        # The hint names what the key would give you, not what is already on
+        # screen - the chart's own axis says which of the two that is.
+        other = "kWh" if self.compare_metric == "cost" else "cost"
+        self.query_one("#compare-title", Label).update(
+            f"┤ COMPARE · {comparison.current.label} vs {comparison.previous.label} ├"
+            f"   [dim](1-4 frame · g {other} · ←→ earlier · home now)[/dim]"
+        )
+
+    def _step_compare(self, direction: int) -> None:
+        """Move the pair of periods back or forward; positive goes back.
+
+        Bounded by the data rather than by an arbitrary depth: stepping past the
+        oldest reading would draw two empty periods and look like a bug, so it
+        says why instead.
+        """
+        target = self.compare_offset + direction
+        if target < 0:
+            if self.compare_offset == 0:
+                self.log_line("[dim]already at the current period[/dim]")
+                return
+            target = 0
+        frame = COMPARE_FRAMES[self.frame_index][1]
+        earliest = costing.parse_time(self.pool[0]["interval_start"]) if self.pool else None
+        # The previous period is the one that would empty out first.
+        _, end = costing.period_window(frame, target + 1)
+        if earliest is not None and end <= earliest:
+            self.log_line(f"[yellow]no {frame} before that in the archive[/yellow]")
+            return
+        self.compare_offset = target
+        self.render_compare()
 
     def render_reconcile(self) -> None:
         """Check the Home Mini's record against settled billing.
@@ -1231,6 +1298,8 @@ class Octoscope(App):
             # Scoped to its own group: a bare exclusive=True would cancel the
             # bootstrap worker still fetching rates and comparison data.
             self.run_worker(self.render_table(), exclusive=True, group="view")
+        elif self.view == "compare":
+            self.render_compare()
         elif self.view == "live":
             # Not exclusive: cancelling a live render would abandon an
             # in-flight fetch already charged against the budget.
@@ -1250,6 +1319,15 @@ class Octoscope(App):
                 return
             self.live_rollup_index = index
             self.run_worker(self.render_live(), group="live")
+            return
+        if self.view == "compare":
+            if index >= len(COMPARE_FRAMES):
+                return
+            self.frame_index = index
+            # Back to the period in progress: an offset counted in days means
+            # something quite different once the frame is months.
+            self.compare_offset = 0
+            self.render_compare()
             return
         if index >= len(PERIODS):
             return
@@ -1296,6 +1374,13 @@ class Octoscope(App):
 
     def action_grain(self) -> None:
         """Cycle the chart's granularity, coarsest-to-finest and round again."""
+        if self.view == "compare":
+            # The compare view's grain is fixed by the frame - a day is read in
+            # hours, a year in months - so the key swaps what is plotted
+            # instead. Same idea: it changes what the bars mean.
+            self.compare_metric = "cost" if self.compare_metric == "kwh" else "kwh"
+            self.render_compare()
+            return
         self.grain_index = (self.grain_index + 1) % len(GRAINS)
         self.render_period(reset_scroll=True)
 
@@ -1329,6 +1414,11 @@ class Octoscope(App):
         if self.view == "chart":
             self._scroll_trend(direction, page=True)
             return
+        if self.view == "compare":
+            # A whole frame at a time either way: the pair being compared has to
+            # stay adjacent, so there is no half step to take.
+            self._step_compare(direction)
+            return
         _, _, _, minutes, _ = LIVE_ROLLUPS[self.live_rollup_index]
         self._shift_window(dt.timedelta(minutes=minutes / 2) * direction)
 
@@ -1336,6 +1426,9 @@ class Octoscope(App):
         """Step by a single bucket, for lining the window up on an event."""
         if self.view == "chart":
             self._scroll_trend(direction, page=False)
+            return
+        if self.view == "compare":
+            self._step_compare(direction)
             return
         _, seconds, _, _, _ = LIVE_ROLLUPS[self.live_rollup_index]
         self._shift_window(dt.timedelta(seconds=seconds) * direction)
@@ -1383,6 +1476,10 @@ class Octoscope(App):
         if self.view == "chart":
             if not self.reconciling:
                 self.query_one("#trend", TrendChart).scroll_home()
+            return
+        if self.view == "compare":
+            self.compare_offset = 0
+            self.render_compare()
             return
         self.live_offset = dt.timedelta(0)
         # Not exclusive: cancelling a live render would abandon an in-flight

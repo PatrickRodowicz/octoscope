@@ -363,6 +363,120 @@ def main() -> None:
     check("an ordinary day is unaffected",
           first_block(dt.date(2026, 7, 20), "6hr").expected_slots, 12)
 
+    print("\n=== period comparison ===")
+
+    def day_of(date: dt.date, kwh: float, slots: int = 48) -> list[dict]:
+        # Stepped in real time from local midnight, the way the meter reports:
+        # on a clock-change day the half-hours keep coming every half hour
+        # whatever the clock says, so the day holds 46 or 50 of them.
+        start = (dt.datetime.combine(date, dt.time(0), tzinfo=costing.UK)
+                 .astimezone(dt.timezone.utc))
+        return [
+            {"interval_start": (start + dt.timedelta(minutes=30 * i)).isoformat(),
+             "consumption": kwh}
+            for i in range(slots)
+        ]
+
+    def compare(pool, frame, when, offset=0):
+        return costing.compare_periods(
+            pool, frame, cal, flat(25.0), flat(25.0), flat(48.0),
+            offset=offset, now=when)
+
+    # Yesterday ran all day at 1 kWh a slot; today has done its first twelve
+    # hours at 2. It is noon, so today is level with yesterday's whole day and
+    # well ahead of where yesterday had got to by now - and those two facts are
+    # the entire reason the like-for-like figure exists.
+    noon = dt.datetime(2026, 7, 21, 12, 0, tzinfo=costing.UK)
+    two_days = day_of(dt.date(2026, 7, 20), 1.0) + day_of(dt.date(2026, 7, 21), 2.0, 24)
+    today = compare(two_days, "day", noon)
+    check("today so far", round(today.current.kwh, 6), 48.0)
+    check("yesterday in full", round(today.previous.kwh, 6), 48.0)
+    check("yesterday by the same hour", round(today.baseline.kwh, 6), 24.0)
+    check("so the change is like for like", round(today.delta("kwh"), 6), 24.0)
+    check("as a percentage", round(today.delta_pct("kwh"), 6), 100.0)
+    check("a running period knows it", today.running, True)
+    check("the day is drawn in hours", len(today.current.starts), 24)
+    check("hours that have not happened stay blank, not zero",
+          today.current.recorded, 12)
+    check("both periods are named", (today.current.label, today.previous.label),
+          ("TODAY", "YESTERDAY"))
+    # An unmistakable spike in one finished hour, and a second one in the hour
+    # still running. The running hour is short by however much of it is yet to
+    # come, so pointing at it would be an artefact of the clock rather than a
+    # change in behaviour - it must lose to the real one.
+    spiked = [dict(row) for row in two_days]
+    for slot in (14, 15):          # 07:00-08:00 today
+        spiked[48 + slot]["consumption"] = 5.0
+    swing = compare(spiked, "day", noon).swing("kwh")
+    check("the hour that differs most",
+          (f"{swing[0].astimezone(costing.UK):%H:%M}", round(swing[1], 6)),
+          ("07:00", 8.0))
+    running = spiked + [
+        {"interval_start": noon.astimezone(dt.timezone.utc).isoformat(),
+         "consumption": 40.0}      # 12:00, the hour that has only just started
+    ]
+    check("and the hour in progress cannot win it",
+          f"{compare(running, 'day', noon).swing('kwh')[0].astimezone(costing.UK):%H:%M}",
+          "07:00")
+
+    # Stepping back lands on two complete periods, so there is nothing to clip.
+    back = compare(two_days, "day", noon, offset=1)
+    check("stepping back compares yesterday with the day before",
+          (back.current.label, back.previous.label), ("YESTERDAY", "SUN 19 JUL"))
+    check("and no longer clips", back.running, False)
+    check("the baseline is then the full previous period",
+          back.baseline is back.previous, True)
+
+    # Months are not the same length as each other, which is exactly the case
+    # a fixed 30-day step would get wrong.
+    march = dt.datetime(2026, 3, 5, 9, 0, tzinfo=costing.UK)
+    monthly: list[dict] = []
+    for day in range(1, 29):
+        monthly += day_of(dt.date(2026, 2, day), 1.0)
+    for day in range(1, 5):
+        monthly += day_of(dt.date(2026, 3, day), 1.0)
+    month = compare(monthly, "month", march)
+    check("march is drawn in 31 days", len(month.current.starts), 31)
+    check("february in 28", len(month.previous.starts), 28)
+    check("february in full", round(month.previous.kwh, 6), 28 * 48.0)
+    check("clipped to the same point in the month",
+          round(month.baseline.kwh, 6), 4 * 48.0 + 18.0)
+    check("which is the same date and time",
+          f"{month.cutoff.astimezone(costing.UK):%d %b %H:%M}", "05 Feb 09:00")
+    check("month names", (month.current.label, month.previous.label),
+          ("THIS MONTH", "LAST MONTH"))
+    check("stepping back a month crosses into last year",
+          compare(monthly, "month", march, offset=2).previous.label, "DEC 2025")
+
+    # The clock-change days. An hourly grid has to have a column for every hour
+    # the day really has, or the readings in the missing one are dropped.
+    fall = dt.datetime(2026, 10, 25, 12, 0, tzinfo=costing.UK)
+    spring = dt.datetime(2026, 3, 29, 12, 0, tzinfo=costing.UK)
+    check("the fall-back day has 25 hourly columns",
+          len(compare([], "day", fall).current.starts), 25)
+    check("and they are all distinct instants",
+          len({m.timestamp() for m in compare([], "day", fall).current.starts}), 25)
+    check("the spring-forward day has 23",
+          len(compare([], "day", spring).current.starts), 23)
+    check("a clock-change week is still seven days",
+          len(compare([], "week", fall).current.starts), 7)
+    check("starting on the monday",
+          f"{compare([], 'week', fall).current.starts[0].astimezone(costing.UK):%a %d %b}",
+          "Mon 19 Oct")
+
+    # Every reading in the period has to land in exactly one column, clock
+    # change or not - the same property the rollup grains are held to above.
+    fall_day = day_of(dt.date(2026, 10, 25), 1.0, slots=50)
+    fall_stat = compare(fall_day, "day", fall).current
+    check("a 25-hour day holds all 50 of its half-hours",
+          round(fall_stat.kwh, 6), 50.0)
+    check("and the columns sum to the same",
+          round(sum(v for v in fall_stat.series if v is not None), 6), 50.0)
+
+    check("a year is drawn in months",
+          len(compare([], "year", noon).current.starts), 12)
+    check("and named by it", compare([], "year", noon, offset=2).current.label, "2024")
+
     print("\n=== an empty response is still cached ===")
     import asyncio
 

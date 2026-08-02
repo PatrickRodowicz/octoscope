@@ -10,22 +10,28 @@ and a projected monthly bill.
 
 | Key | Action |
 | --- | --- |
-| `tab` | cycle views: **chart → table → live → tariffs** |
+| `tab` | cycle views: **chart → compare → table → live → tariffs** |
 | `↑` `↓` | table/tariffs: move the cursor — on TARIFFS this picks the comparison |
-| `1`–`5` | chart/tariffs: 7d / 30d / 90d / all · table: 5min / 30min / 60min / day / month · live: granularity |
-| `←` `→` | live view: pan history by half a window |
+| `1`–`5` | chart/tariffs: 7d / 30d / 90d / all · compare: day / week / month / year · table: 5min / 30min / 60min / day / month · live: granularity |
+| `g` | chart: granularity · compare: swap kWh for cost |
+| `←` `→` | live view: pan history by half a window · compare: step back a whole period |
 | `shift`+`←` `→` | live view: step one bucket at a time |
-| `home` | live view: jump back to now |
+| `home` | live/compare view: jump back to now |
 | `r` | force refresh |
 | `p` | pause/resume background polling — see [Stepping away](#stepping-away) |
 | `l` | swap the spikes pane for the event log |
 | `q` | quit |
 
-## The four views
+## The five views
 
 **CHART** — usage bars (day/night stacked) with a separate cost chart and its
 own money axis. Window (`1`–`6`) and granularity (`g`) are chosen
 independently, and the chart scrolls.
+
+**COMPARE** — one period against the one before it: today vs yesterday, this
+week vs last, this month vs last, this year vs last (`1`–`4`). The period in
+progress is compared against the previous one measured to the same point in
+itself, so the change is like for like all day rather than only at midnight.
 
 **TABLE** — rollups at 5 / 30 / 60 minutes, day, month.
 
@@ -240,6 +246,64 @@ a week of hourly bars reads `12/07 … 13/07 … 14/07` rather than a useless ro
 
 **Bottom — day vs night**, which is the lever that actually matters on
 Economy 7, and a secondary tariff comparison pane.
+
+## Compare view (`tab`)
+
+Usage across two adjacent periods of the same length. `1`–`4` pick the frame —
+day, week, month, year — and `←` `→` step the pair back and forward through
+history a whole period at a time, `home` returns to the present. `g` swaps the
+chart between kWh and money; the headline shows both either way.
+
+```
+THIS WEEK                  51.72 kWh     £15.06   so far · day 7 of 7
+LAST WEEK                  85.67 kWh     £24.08   to the same point
+CHANGE                    -33.95 kWh     -£9.02   -39.6% by kWh
+LAST WEEK in full          87.97 kWh     £24.79
+  biggest day apart  Thu 30 Jul  -20.00 kWh
+
+ 25.6┤                                                 ────────────────
+ 21.9┤
+     │
+ 14.6┤                ────────────────                                     ████████████████
+     │────────────────████████████████─────────────────      ─────────────████████████████─────────────────
+  7.3┤▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅████████████████▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅────────────────
+     │███████████████████████████████████████████████████████████████████████████████████████▁▁▁▁▁▁▁▁▁▁▁▁▁
+  0.0└──────────────────────────────────────────────────────────────────────────────────────────────────────  kWh
+      Mon             Tue             Wed              Thu             Fri              Sat             Sun
+  █ this week    ─── last week, day by day
+```
+
+### Like for like
+
+A period in progress has only got so far into itself. Holding a Tuesday morning
+up against the whole of Monday reports a collapse in usage every morning and a
+recovery every evening, which is an artefact of the clock rather than anything
+about the house. So while the current period is running, the previous one is
+measured **to the same point in itself** — the same time of day, the same day
+of the week, the same date in the month — and that is what `CHANGE` is computed
+from. Its full total is kept on the line below, because where the previous
+period ended up is the other thing worth knowing.
+
+Stepping back to two finished periods drops both the clipping and that line:
+there is nothing left to be fair about.
+
+### Reading the chart
+
+Bars are the current period; the cyan line is the previous one at the same hour,
+day or month. Where the line crosses a bar, the gap between them is the change
+in that bucket — a bar poking above its line used more than its counterpart did,
+and one stopping short of it used less. Buckets that have not happened yet are
+blank rather than zero, so the day does not appear to fall off a cliff at the
+current hour.
+
+`biggest ... apart` names the single bucket that moved most. Only buckets both
+periods recorded count, and only ones that have finished — the hour in progress
+is short by however much of it is still to come, and would otherwise win most of
+the time.
+
+Nothing here costs an API call. It reads the same merged pool the chart does, so
+the two views cannot disagree about what a day used, and stepping back through
+history is free however far you go.
 
 ## Table view (`tab`)
 
@@ -933,5 +997,6 @@ cache, and deleting it loses history permanently.
 
 - Desktop notification / ntfy.sh push (currently in-TUI only, by choice)
 - Per-half-hour heatmap to spot which times of day dominate the bill
-- Compare against the same month last year once there is a year of history
+- A compare frame for the same period a year back, rather than the one before
+  it, once there is more than a year of history to line up
 # octoscope
