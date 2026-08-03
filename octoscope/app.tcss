@@ -12,6 +12,15 @@ Screen {
     color: #00ff41;
 }
 
+/* The picker for the number keys. One row, never scrolls, never hidden - it is
+   the answer to "what will 1-9 do here?" and has to be readable at a glance. */
+#controls {
+    height: 1;
+    padding: 0 1;
+    background: #050805;
+    color: #00ff41;
+}
+
 .banner {
     height: 3;
     content-align: center middle;

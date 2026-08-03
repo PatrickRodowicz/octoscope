@@ -549,17 +549,6 @@ class Bucket:
         return f"{self.day_kwh / self.kwh * 100:.0f}/{self.night_kwh / self.kwh * 100:.0f} d/n"
 
 
-# Rollup granularities offered by the table view. Sub-hour rollups need Home
-# Mini telemetry; the rest come from settled half-hourly consumption.
-ROLLUPS: dict[str, str] = {
-    "5min": "5 MIN",
-    "30min": "30 MIN",
-    "60min": "60 MIN",
-    "day": "DAY",
-    "month": "MONTH",
-}
-
-
 # Rollup periods shorter than a day. These label their bars with a time rather
 # than a bare date, and are fine-grained enough that "did the home mini supply
 # this?" is a meaningful question about a single bar. Named once here so adding
@@ -676,66 +665,6 @@ def rollup(
         if bucket.end > now or bucket.slots < bucket.expected_slots:
             bucket.partial = True
     return [buckets[k] for k in sorted(buckets)]
-
-
-def patch_today(
-    buckets: list[Bucket],
-    today: DayTotal | None,
-    settled_today: Bucket | None,
-    period: str,
-) -> list[Bucket]:
-    """Swap today's stale settled figures for live telemetry.
-
-    Settled consumption lags by most of a day, so without this the current day
-    and month rows disagree with the TODAY tile, which reads from the Home Mini
-    and is hours fresher. For a day row we substitute outright; for a month row
-    we exchange only today's share and keep the settled remainder.
-    """
-    if today is None or period not in ("day", "month"):
-        return buckets
-
-    key = _bucket_start(dt.datetime.now(UK), period)
-    stale_day_kwh = settled_today.day_kwh if settled_today else 0.0
-    stale_night_kwh = settled_today.night_kwh if settled_today else 0.0
-    stale_day_cost = settled_today.day_cost_p if settled_today else 0.0
-    stale_night_cost = settled_today.night_cost_p if settled_today else 0.0
-    stale_standing = settled_today.standing_p if settled_today else 0.0
-
-    for index, bucket in enumerate(buckets):
-        if bucket.start != key:
-            continue
-        if period == "day":
-            buckets[index] = Bucket(
-                start=bucket.start, end=bucket.end,
-                day_kwh=today.day_kwh, night_kwh=today.night_kwh,
-                day_cost_p=today.day_cost_p, night_cost_p=today.night_cost_p,
-                # The day's standing charge is incurred in full whatever the
-                # hour, so show all of it rather than the settled fraction.
-                standing_p=today.standing_p, partial=True,
-            )
-        else:
-            buckets[index] = Bucket(
-                start=bucket.start, end=bucket.end,
-                day_kwh=bucket.day_kwh - stale_day_kwh + today.day_kwh,
-                night_kwh=bucket.night_kwh - stale_night_kwh + today.night_kwh,
-                day_cost_p=bucket.day_cost_p - stale_day_cost + today.day_cost_p,
-                night_cost_p=bucket.night_cost_p - stale_night_cost + today.night_cost_p,
-                standing_p=bucket.standing_p - stale_standing + today.standing_p,
-                partial=True,
-            )
-        return buckets
-
-    # No row for the current period yet (nothing settled today): add one.
-    if period == "day":
-        buckets.append(
-            Bucket(
-                start=key, end=_bucket_end(key, period),
-                day_kwh=today.day_kwh, night_kwh=today.night_kwh,
-                day_cost_p=today.day_cost_p, night_cost_p=today.night_cost_p,
-                standing_p=today.standing_p, partial=True,
-            )
-        )
-    return buckets
 
 
 # ---------------- period comparison ----------------
@@ -1139,6 +1068,25 @@ class PowerBucket:
     @property
     def kwh(self) -> float:
         return self.wh / 1000.0
+
+    @property
+    def export_wh(self) -> float:
+        """Energy sent back to the grid over this slice.
+
+        Derived from the signed net flow rather than metered, because there is
+        no export MPAN to read: `wh` is floored at zero, so the only record of
+        generation leaving the house is demand going negative. Average net
+        power times the slice's own length keeps this additive - the sum over a
+        window is that window's export however finely it was bucketed.
+        """
+        net = self.net_watts
+        if net >= 0:
+            return 0.0
+        return -net * (self.end - self.start).total_seconds() / 3600.0
+
+    @property
+    def export_kwh(self) -> float:
+        return self.export_wh / 1000.0
 
 
 def aggregate_power(readings: list[dict], bucket_seconds: int) -> list[PowerBucket]:

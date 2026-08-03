@@ -59,6 +59,116 @@ def _signed_money(pence: float) -> str:
     return f"{'-' if pence < 0 else '+'}{_money(abs(pence))}"
 
 
+class ControlBar(Static):
+    """The numbered options for whatever view is up, with the active one lit.
+
+    The dashboard's number keys used to mean something different in every view
+    and there was nothing on screen that said what. Rather than documenting
+    that in a caption nobody reads, the options are drawn as a picker: the keys
+    that exist, in order, with the current selection highlighted. Discovering
+    that `1` is TODAY takes a glance rather than a manual.
+
+    Two rows of controls at most - the primary set the number keys drive, and
+    the secondary set `g` cycles - because a control bar that needs studying
+    has failed at the job it was added to do.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.options: list[tuple[str, str, str]] = []   # key, full, short
+        self.active = 0
+        self.groups: list[tuple[int, int]] = []
+        self.secondary: list[tuple[str, str]] = []      # label, short
+        self.secondary_active = 0
+        self.secondary_key = "g"
+        self.note = ""
+        self._state: tuple | None = None
+
+    def update_controls(
+        self,
+        options: list[tuple[str, str, str]],
+        active: int,
+        *,
+        groups: list[tuple[int, int]] | None = None,
+        secondary: list[tuple[str, str]] | None = None,
+        secondary_active: int = 0,
+        secondary_key: str = "g",
+        note: str = "",
+    ) -> None:
+        state = (options, active, groups, secondary, secondary_active,
+                 secondary_key, note)
+        # The live view redraws its caption once a second for the countdown and
+        # calls through to here each time; the bar itself almost never changes,
+        # so compare before repainting rather than churning a widget per tick.
+        if state == self._state:
+            return
+        self._state = state
+        self.options = options
+        self.active = active
+        self.groups = groups or [(0, len(options))]
+        self.secondary = secondary or []
+        self.secondary_active = secondary_active
+        self.secondary_key = secondary_key
+        self.note = note
+        self.refresh_content()
+
+    def on_resize(self) -> None:
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        if not self.options:
+            self.update(Text(""))
+            return
+        # Full labels while they fit, then abbreviations - the trailing note
+        # first, since it is the part you stop needing once you know the keys,
+        # and the numbered options last, since hiding those defeats the bar.
+        # It has to be all visible or it is not a picker, and truncating from
+        # the right hides exactly the long-tail options someone is hunting for.
+        width = self.size.width
+        for short_grain, short_range, note in (
+            (False, False, True), (True, False, True), (True, True, True),
+            (True, True, False),
+        ):
+            line = self._compose_line(short_grain, short_range, note)
+            if not width or line.cell_len <= width:
+                break
+        self.update(line)
+
+    def _compose_line(
+        self, short_grain: bool, short_range: bool, note: bool
+    ) -> Text:
+        line = Text()
+        for first, last in self.groups:
+            if line.cell_len:
+                line.append(" │", style=DIM)
+            for index in range(first, min(last, len(self.options))):
+                key, full, brief = self.options[index]
+                self._chip(line, key, brief if short_range else full,
+                           index == self.active)
+        if self.secondary:
+            line.append(" │ ", style=DIM)
+            line.append(self.secondary_key, style=GREEN)
+            for index, (full, brief) in enumerate(self.secondary):
+                self._chip(line, "", brief if short_grain else full,
+                           index == self.secondary_active)
+        if note and self.note:
+            line.append(f"  {self.note}", style=DIM)
+        return line
+
+    @staticmethod
+    def _chip(line: Text, key: str, label: str, active: bool) -> None:
+        """One option. The active one is filled, so it reads at a glance."""
+        if active:
+            line.append(f" {key} {label} " if key else f" {label} ",
+                        style=f"bold {GREEN} on #1f5f2f")
+            return
+        # The key stays bright while the label dims: the number is the part you
+        # are scanning for, and it is what you have to type.
+        if key:
+            line.append(f" {key}", style=GREEN)
+        line.append(f" {label} ", style=DIM)
+
+
 class StatTile(Static):
     """A single headline figure with supporting lines beneath."""
 
@@ -521,7 +631,7 @@ class TrendChart(Static):
             summary.append(
                 f"  ({self.shown} of {self.available_columns} {self.unit}s"
                 f", totals above cover all of them)", style=DIM)
-            summary.append("   ← → scroll", style=DIM)
+            summary.append("   shift+← → scroll", style=DIM)
             if self.column_offset:
                 summary.append("   home = latest", style=DIM)
         running = [c for c in self.columns if c.partial]
@@ -1057,12 +1167,20 @@ def _tariff_style(bucket: Bucket) -> str:
 
 
 def _period_label(bucket: Bucket, period: str) -> str:
+    """Name a row at whatever grain the range is being sliced into.
+
+    Every grain the chart can draw has a row label, because the table is now
+    the same buckets as the chart - a week bucket falling through to a
+    half-hour format printed "Mon 14 Jul 00:00-00:00" and read as a bug.
+    """
     start = bucket.start
     if period == "month":
         return start.strftime("%B %Y")
+    if period == "week":
+        return f"week of {start:%d %b}"
     if period == "day":
         return start.strftime("%a %d %b")
-    if period == "60min":
+    if period in ("6hr", "12hr"):
         return f"{start:%a %d %b  %H:%M}-{bucket.end:%H:%M}"
     return f"{start:%a %d %b  %H:%M}-{bucket.end:%H:%M}"
 
@@ -1212,8 +1330,14 @@ class LiveView(Static):
                 minutes = sum(
                     (b.end - b.start).total_seconds() / 60 for b in exporting
                 )
-                window.append(f"  ·  {_duration(dt.timedelta(minutes=minutes))} exporting",
-                              style=EXPORT_STYLE)
+                # How long *and* how much. The duration alone cannot separate
+                # an afternoon of trickle from twenty minutes of full sun, and
+                # it is the energy that a future export tariff would pay for.
+                sent = sum(b.export_kwh for b in exporting)
+                window.append(
+                    f"  ·  {sent:.3f} kWh out over "
+                    f"{_duration(dt.timedelta(minutes=minutes))}",
+                    style=EXPORT_STYLE)
                 window.append(f" (peak {abs(min(net)):,.0f} W)", style=DIM)
             else:
                 window.append(f"  peak {max(net):,.0f} W", style=DIM)

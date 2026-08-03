@@ -6,6 +6,7 @@ import datetime as dt
 import time
 from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -23,7 +24,7 @@ from .config import (
     TTL_TELEMETRY_TODAY,
     load_config,
 )
-from .costing import ROLLUPS, UK, Calibration, DayTotal, RateTimeline
+from .costing import UK, Calibration, DayTotal, RateTimeline
 from .store import TelemetryStore
 from .store import best_source as store_best
 from .store import reach as store_reach
@@ -31,6 +32,7 @@ from .widgets import (
     BillsPane,
     Column,
     ComparePane,
+    ControlBar,
     ForecastTile,
     LiveView,
     MonthTile,
@@ -67,51 +69,147 @@ def _sweep(frame: int) -> str:
         position = cycle - position
     return "░" * position + "█" * SPINNER_BLOCK + "░" * (span - position)
 
-# Trend periods, selectable with the number keys. A window ending now rather
-# than a count of complete days: the last 12 hours are mostly unsettled, so a
-# day-counting period could not express them at all.
-PERIODS: list[tuple[str, dt.timedelta | None]] = [
-    ("12 HOURS", dt.timedelta(hours=12)),
-    ("24 HOURS", dt.timedelta(hours=24)),
-    ("7 DAYS", dt.timedelta(days=7)),
-    ("30 DAYS", dt.timedelta(days=30)),
-    ("90 DAYS", dt.timedelta(days=90)),
-    ("ALL", None),
-]
+# ---------------------------------------------------------------------------
+# The time model
+#
+# Two ideas, and they are the same two in every view that looks at history: a
+# RANGE says which stretch of time is on screen, and a GRAIN says how finely
+# that stretch is sliced. The number keys always pick the range; `g` always
+# picks the grain; ←/→ always step the range; `home` always returns to now.
+#
+# Each view used to own a private meaning for the number keys - a rolling
+# window on the chart, a bucket size in the table, a calendar frame in compare,
+# a fetch resolution in live - so the same keypress did four unrelated things
+# and "just today" could not be asked for at all. Ranges are calendar-first for
+# exactly that reason: TODAY and THIS WEEK are what people actually want, and a
+# rolling 24 hours is a different question that now has its own key rather than
+# being the closest available approximation.
+#
+# Grain is constrained by range rather than free-running. Every range names the
+# grains it can be drawn at, so the pair on screen is always one that makes
+# sense: no month-wide bars across a single day, no 4,000 half-hour columns
+# across a year. The relationship holds in both directions and in every view,
+# which is what makes it predictable.
+# ---------------------------------------------------------------------------
 
-# Chart granularities, cycled with `g`: label, rollup key, noun for "per X".
+# Bucket sizes, finest first: label, the noun for "per X" in a caption, and an
+# abbreviation for a control bar with no room for the label.
 # Settled consumption arrives half-hourly, so 30 MIN is the meter's own
 # resolution and everything coarser is a sum of it - nothing is interpolated.
-GRAINS: list[tuple[str, str, str]] = [
-    ("30 MIN", "30min", "half-hour"),
-    ("HOUR", "60min", "hour"),
-    ("6 HOUR", "6hr", "6-hour block"),
-    ("12 HOUR", "12hr", "12-hour block"),
-    ("DAY", "day", "day"),
-    ("WEEK", "week", "week"),
-    ("MONTH", "month", "month"),
+# Finer than that is live telemetry, which is what the LIVE view is for.
+GRAINS: dict[str, tuple[str, str, str]] = {
+    "30min": ("30 MIN", "half-hour", "30M"),
+    "60min": ("HOUR", "hour", "1H"),
+    "6hr": ("6 HOUR", "6-hour block", "6H"),
+    "12hr": ("12 HOUR", "12-hour block", "12H"),
+    "day": ("DAY", "day", "DAY"),
+    "week": ("WEEK", "week", "WK"),
+    "month": ("MONTH", "month", "MTH"),
+}
+
+
+@dataclass(frozen=True)
+class Range:
+    """One selectable stretch of time.
+
+    Calendar ranges (`unit` set) snap to real boundaries - a day starts at
+    midnight, a week on Monday - so "this week" means the week, not the last
+    seven days. Rolling ranges (`span` set) end now, for the questions where
+    the boundary is the wrong thing to care about. ALL sets neither.
+
+    `base` is how many whole units back the range sits before any stepping, so
+    YESTERDAY is simply the day range at base 1.
+    """
+
+    key: str
+    label: str
+    grains: tuple[str, ...]
+    grain: str
+    frame: str                          # calendar frame the compare view uses
+    short: str = ""                     # for a control bar too narrow for labels
+    unit: str | None = None             # calendar unit this range snaps to
+    base: int = 0                       # whole units back before stepping
+    span: dt.timedelta | None = None    # rolling window length
+
+    @property
+    def brief(self) -> str:
+        return self.short or self.label
+
+    @property
+    def unbounded(self) -> bool:
+        """Has no window at all - the whole archive, and nothing to step."""
+        return self.unit is None and self.span is None
+
+    def window(
+        self, offset: int = 0, now: dt.datetime | None = None
+    ) -> tuple[dt.datetime | None, dt.datetime | None]:
+        """Bounds of this range, `offset` steps further back. None means open."""
+        now = now or dt.datetime.now(UK)
+        if self.unit is not None:
+            return costing.period_window(self.unit, self.base + offset, now)
+        if self.span is None:
+            return None, None
+        end = now - self.span * offset
+        return end - self.span, end
+
+    def name(self, offset: int = 0, now: dt.datetime | None = None) -> str:
+        """What to call this range once it has been stepped back `offset`.
+
+        A stepped calendar range renames itself properly - THIS WEEK becomes
+        LAST WEEK becomes WEEK OF 14 JUL - because a caption still reading
+        "THIS WEEK" over July's bars is worse than no caption at all.
+        """
+        now = now or dt.datetime.now(UK)
+        if self.unit is not None:
+            start, _ = self.window(offset, now)
+            return costing.period_name(self.unit, start, now)
+        if offset == 0 or self.span is None:
+            return self.label
+        start, end = self.window(offset, now)
+        stamp = "%d %b %H:%M" if self.span < dt.timedelta(days=2) else "%d %b"
+        return f"{start:{stamp}} - {end:{stamp}}".upper()
+
+
+# Selectable with the number keys, in this order. Calendar ranges first because
+# they answer the question people ask; the rolling ones follow; ALL last.
+RANGES: list[Range] = [
+    Range("today", "TODAY", ("30min", "60min", "6hr"), "60min", "day",
+          unit="day"),
+    Range("yesterday", "YESTERDAY", ("30min", "60min", "6hr"), "60min", "day",
+          short="YDAY", unit="day", base=1),
+    Range("week", "THIS WEEK", ("60min", "6hr", "12hr", "day"), "day", "week",
+          short="WEEK", unit="week"),
+    Range("month", "THIS MONTH", ("6hr", "12hr", "day", "week"), "day", "month",
+          short="MONTH", unit="month"),
+    Range("24h", "LAST 24 HOURS", ("30min", "60min", "6hr"), "30min", "day",
+          short="24H", span=dt.timedelta(hours=24)),
+    Range("7d", "LAST 7 DAYS", ("60min", "6hr", "12hr", "day"), "day", "week",
+          short="7D", span=dt.timedelta(days=7)),
+    Range("30d", "LAST 30 DAYS", ("6hr", "12hr", "day", "week"), "day", "month",
+          short="30D", span=dt.timedelta(days=30)),
+    Range("90d", "LAST 90 DAYS", ("day", "week", "month"), "day", "month",
+          short="90D", span=dt.timedelta(days=90)),
+    Range("all", "ALL", ("day", "week", "month"), "week", "year"),
 ]
 
-# Live trace granularities: label, bucket seconds, API grouping, window minutes,
+# Where the calendar block ends and the rolling block begins, so the control
+# bar can rule a line between two kinds of question rather than showing nine
+# undifferentiated options.
+RANGE_GROUPS = [(0, 4), (4, 8), (8, 9)]
+
+# Live trace resolutions: label, bucket seconds, API grouping, window minutes,
 # cache seconds. Longer windows are cached harder because they move slowly and
 # every call comes out of the 125/h telemetry budget.
+#
+# This is the one view whose number keys cannot mean a time range - it is about
+# the present moment only, and its options trade resolution against budget
+# rather than picking a stretch of history. The control bar relabels itself
+# accordingly rather than leaving you to infer the difference.
 LIVE_ROLLUPS: list[tuple[str, int, str, int, int]] = [
     ("10 SEC · 30 MIN", 10, "TEN_SECONDS", 30, 0),
     ("1 MIN · 2 HR", 60, "ONE_MINUTE", 120, 120),
     ("5 MIN · 6 HR", 300, "ONE_MINUTE", 360, 300),
     ("30 MIN · 24 HR", 1800, "HALF_HOURLY", 1440, 900),
-]
-
-# Comparison frames, selectable with the number keys in the compare view: the
-# label, and the calendar period it steps over. Calendar periods rather than
-# rolling windows, because "this month vs last month" is the question people
-# actually ask - and the two halves of a rolling window share a boundary that
-# moves under them every time you look.
-COMPARE_FRAMES: list[tuple[str, str]] = [
-    ("DAY", "day"),
-    ("WEEK", "week"),
-    ("MONTH", "month"),
-    ("YEAR", "year"),
 ]
 
 # Tab cycles through these: view name, the pane it shows, and the widget that
@@ -137,18 +235,20 @@ class Octoscope(App):
         Binding("q", "quit", "quit", priority=True),
         Binding("tab", "toggle_view", "view", priority=True),
         Binding("r", "refresh", "refresh", priority=True),
-        Binding("1", "period(0)", "12h", priority=True),
-        Binding("2", "period(1)", "24h", priority=True),
-        Binding("3", "period(2)", "7d", priority=True),
-        Binding("4", "period(3)", "30d", priority=True),
-        Binding("5", "period(4)", "90d", priority=True),
-        Binding("6", "period(5)", "all", priority=True),
-        Binding("left", "scrub(1)", "back", priority=True),
-        Binding("right", "scrub(-1)", "fwd", priority=True),
-        Binding("shift+left", "nudge(1)", "step", priority=True),
-        Binding("shift+right", "nudge(-1)", "step", priority=True),
+    ] + [
+        # One key per range, in the order the control bar draws them. Generated
+        # so the keys, the bar and RANGES can never drift apart.
+        Binding(str((index + 1) % 10), f"pick({index})", r.label.lower(),
+                priority=True, show=False)
+        for index, r in enumerate(RANGES)
+    ] + [
+        Binding("left", "scrub(1)", "earlier", priority=True),
+        Binding("right", "scrub(-1)", "later", priority=True),
+        Binding("shift+left", "nudge(1)", "scroll", priority=True),
+        Binding("shift+right", "nudge(-1)", "scroll", priority=True),
         Binding("home", "scrub_now", "now", priority=True),
         Binding("g", "grain", "grain", priority=True),
+        Binding("m", "metric", "kWh/cost", priority=True, show=False),
         Binding("p", "pause", "pause", priority=True),
         Binding("o", "toggle_reconcile", "vs live", priority=True),
         Binding("l", "toggle_log", "log", priority=True),
@@ -168,17 +268,17 @@ class Octoscope(App):
         self.today: DayTotal | None = None
         self.provisional: list[DayTotal] = []
         self.provisional_readings: list[dict] = []
-        self.period_index = 3  # 30 days
-        self.grain_index = GRAINS.index(("DAY", "day", "day"))
+        # The one piece of state every history view reads: which stretch of
+        # time, how many steps back, and how finely to slice it.
+        self.range_index = RANGES.index(next(r for r in RANGES if r.key == "30d"))
+        self.range_offset = 0
+        self.grain = self.time_range.grain
         # Settled readings with Home Mini filling anything Octopus has not
         # published. Every chart figure comes from this one series.
         self.pool: list[dict] = []
         self.provisional_dates: set[dt.date] = set()
         self.reconciling = False
-        self.rollup_index = 3  # day
         self.view_index = 0
-        self.frame_index = 0      # compare view: day vs day
-        self.compare_offset = 0   # whole frames back from the period in progress
         self.compare_metric = "kwh"
         self.live_rollup_index = 0
         self.live_offset = dt.timedelta(0)
@@ -202,6 +302,57 @@ class Octoscope(App):
         self._tariff_readings: list[dict] = []
         self._tariff_load: asyncio.Future | None = None
 
+    # ---------------- the selected stretch of time ----------------
+
+    @property
+    def time_range(self) -> Range:
+        return RANGES[self.range_index]
+
+    @property
+    def range_label(self) -> str:
+        return self.time_range.name(self.range_offset)
+
+    @property
+    def grain_label(self) -> str:
+        return GRAINS[self.grain][0]
+
+    @property
+    def grain_unit(self) -> str:
+        return GRAINS[self.grain][1]
+
+    @property
+    def range_window(self) -> tuple[dt.datetime | None, dt.datetime | None]:
+        return self.time_range.window(self.range_offset)
+
+    @property
+    def compare_offset(self) -> int:
+        """The selected range expressed as whole frames back, for compare.
+
+        The compare view is the same range asked as a question about change, so
+        it follows the number keys like everything else rather than keeping a
+        second, separate notion of where you are in time.
+        """
+        return self.time_range.base + self.range_offset
+
+    def _fit_grain(self, previous: str | None = None) -> None:
+        """Settle on a grain this range can actually be drawn at.
+
+        Keeps the intent behind the old choice rather than snapping to the
+        default every time: if you were looking at hours and the new range only
+        goes down to 6-hour blocks, you get 6-hour blocks - the closest thing to
+        what you asked for - and only a range you have not expressed a
+        preference for falls back to its own default.
+        """
+        allowed = self.time_range.grains
+        if self.grain in allowed:
+            return
+        if previous is None:
+            self.grain = self.time_range.grain
+            return
+        order = list(GRAINS)
+        want = order.index(previous)
+        self.grain = min(allowed, key=lambda key: abs(order.index(key) - want))
+
     # ---------------- layout ----------------
 
     def compose(self) -> ComposeResult:
@@ -219,6 +370,9 @@ class Octoscope(App):
             with Vertical(classes="pane"):
                 yield Label("┤ FORECAST ├", classes="pane-title")
                 yield ForecastTile(id="forecast")
+        # Directly above the pane it drives, and never hidden: whatever view is
+        # up, this row is what the number keys will do to it.
+        yield ControlBar(id="controls")
         with Vertical(classes="pane", id="trend-pane"):
             yield Label("┤ USAGE & SPEND ├", classes="pane-title", id="trend-title")
             yield TrendChart(id="trend")
@@ -265,6 +419,9 @@ class Octoscope(App):
             f"{counts['consumption']} settled half-hours[/dim]"
         )
         self.set_interval(SPINNER_INTERVAL, self.tick_spinner)
+        # Before any data lands: the controls work from the first frame, so
+        # they are on screen from the first frame rather than after a fetch.
+        self.render_controls()
         self.run_worker(self.bootstrap(), exclusive=False)
 
     async def on_unmount(self) -> None:
@@ -597,83 +754,143 @@ class Octoscope(App):
         """Days good enough to average - settled, or provisionally complete."""
         return [t for t in self.merged_totals if not t.partial]
 
-    def render_period(self, reset_scroll: bool = False) -> None:
-        label, span = PERIODS[self.period_index]
-        grain_label, grain, unit = GRAINS[self.grain_index]
+    def render_controls(self) -> None:
+        """Redraw the picker above the panes for whichever view is up.
 
-        columns = self._columns(span, grain)
+        Called from every render path, so the bar cannot end up describing a
+        view that is no longer on screen.
+        """
+        try:
+            bar = self.query_one("#controls", ControlBar)
+        except NoMatches:  # tearing down
+            return
+        if self.view == "live":
+            # Not a time range: see LIVE_ROLLUPS. Labelled as what it is so the
+            # difference from every other view is visible rather than inferred.
+            bar.update_controls(
+                [(str(index + 1), label, label.split("·")[0].strip())
+                 for index, (label, *_) in enumerate(LIVE_ROLLUPS)],
+                self.live_rollup_index,
+                note="trace resolution · always ending now · ←→ scrolls the window",
+            )
+            return
+
+        selected = self.time_range
+        note_bits: list[str] = []
+        if self.range_offset:
+            note_bits.append(f"{self.range_label} · home returns to now")
+        elif not selected.unbounded:
+            note_bits.append("←→ earlier/later")
+        if self.view == "compare":
+            note_bits.append(f"m plots {'kWh' if self.compare_metric == 'cost' else 'cost'}")
+        elif self.view == "chart":
+            note_bits.append("o settled vs live")
+        bar.update_controls(
+            [(str((index + 1) % 10), r.label, r.brief)
+             for index, r in enumerate(RANGES)],
+            self.range_index,
+            groups=RANGE_GROUPS,
+            # The compare view slices by its own frame - a day into hours, a
+            # year into months - so offering a grain that does nothing would be
+            # a lie. Nothing is shown rather than something inert.
+            secondary=(
+                [] if self.view == "compare"
+                else [(GRAINS[key][0], GRAINS[key][2]) for key in selected.grains]
+            ),
+            secondary_active=(
+                selected.grains.index(self.grain)
+                if self.grain in selected.grains else 0
+            ),
+            note=" · ".join(note_bits),
+        )
+
+    def render_period(self, reset_scroll: bool = False) -> None:
+        label = self.range_label
+        columns = self._columns()
         # Scroll position survives a background refresh - a telemetry poll must
         # not yank you back to now while you are reading last month - but a
-        # deliberate change of period or grain starts from the latest data.
+        # deliberate change of range or grain starts from the latest data.
         self.query_one("#trend", TrendChart).update_columns(
-            columns, label, grain=grain_label, unit=unit,
+            columns, label, grain=self.grain_label, unit=self.grain_unit,
             reset_scroll=reset_scroll)
         if not self.reconciling:
             # The overlay owns the title while it is up, so a background
             # refresh cannot relabel the pane with the chart it is hiding.
             self.query_one("#trend-title", Label).update(
-                f"┤ USAGE & SPEND · {label} · {grain_label} ├"
-                "   [dim](1-6 period · g grain · o settled vs live)[/dim]"
+                f"┤ USAGE & SPEND · {label} · per {self.grain_unit} ├"
             )
         # Day vs night is a property of the day however the chart is sliced, so
         # this pane stays on whole days regardless of the selected granularity.
         self.query_one("#split", SplitPane).update_split(
-            self._split_days(span), self.calibration.night_window,
+            self._split_days(), self.calibration.night_window,
             self.calibration.confident,
             day_rate=self.day_rates.latest,
             night_rate=self.night_rates.latest,
             standing=self.standing.latest)
         self.render_month()
+        self.render_controls()
         if self.reconciling:
             self.render_reconcile()
         if self.view == "compare":
             # Same pool, so a poll that moves the chart moves this too.
             self.render_compare()
 
-    def _columns(self, span: dt.timedelta | None, grain: str) -> list[Column]:
-        """Bucket the merged reading pool for `span` at `grain`.
+    def _window_pool(self) -> list[dict]:
+        """The merged reading pool clipped to the selected range."""
+        start, end = self.range_window
+        if start is None and end is None:
+            return self.pool
+        return [
+            r for r in self.pool
+            if (when := costing.parse_time(r.get("interval_start"))) is not None
+            and (start is None or when >= start)
+            and (end is None or when < end)
+        ]
 
-        One code path for every period and grain. Each reading falls in exactly
-        one bucket whatever the grain, so the period total is the same however
-        it is sliced - which is the property that kept breaking when days and
-        sub-day buckets were assembled separately.
+    def _buckets(self) -> list[costing.Bucket]:
+        """Bucket the selected range at the selected grain.
+
+        One code path for every range, grain and view - the chart, the table and
+        the rollups behind them are the same numbers sliced the same way, which
+        is the property that kept breaking while each view rolled its own.
+        Every reading falls in exactly one bucket whatever the grain, so the
+        range total is the same however it is sliced.
         """
-        pool = self.pool
-        if span is not None:
-            cutoff = dt.datetime.now(UK) - span
-            pool = [
-                r for r in pool
-                if (when := costing.parse_time(r.get("interval_start"))) is not None
-                and when >= cutoff
-            ]
+        pool = self._window_pool()
         if not pool:
             return []
-        buckets = costing.rollup(
-            pool, grain, self.calibration, self.day_rates, self.night_rates,
+        return costing.rollup(
+            pool, self.grain, self.calibration, self.day_rates, self.night_rates,
             self.standing)
-        columns = [Column.from_bucket(b, grain) for b in buckets]
+
+    def _columns(self) -> list[Column]:
+        columns = [Column.from_bucket(b, self.grain) for b in self._buckets()]
         # Flag the bars whose energy came from the meter rather than a bill.
         # Only meaningful per day or finer; a week straddles both sources.
-        if grain in costing.SUB_DAY_PERIODS or grain == "day":
+        if self.grain in costing.SUB_DAY_PERIODS or self.grain == "day":
             provisional = self.provisional_dates
             for column in columns:
                 if column.start.astimezone(UK).date() in provisional:
                     column.provisional = True
         return columns
 
-    def _split_days(self, span: dt.timedelta | None) -> list[DayTotal]:
-        """Whole days in the period, for the day-vs-night pane.
+    def _split_days(self) -> list[DayTotal]:
+        """Whole days in the range, for the day-vs-night pane.
 
-        A sub-day period contains no whole day, and the split of a half
-        finished one says nothing. Rather than blanking the pane, fall back to
-        the most recent complete day - which is the like-for-like comparison
-        someone looking at the last 12 hours actually wants.
+        A range shorter than a day contains no whole day, and the split of a
+        half finished one says nothing. Rather than blanking the pane, fall
+        back to the most recent complete day - which is the like-for-like
+        comparison someone looking at today actually wants.
         """
         complete = self.complete_totals
-        if span is None:
+        start, end = self.range_window
+        if start is None and end is None:
             return complete
-        cutoff = (dt.datetime.now(UK) - span).date()
-        window = [t for t in complete if t.date >= cutoff]
+        window = [
+            total for total in complete
+            if (start is None or total.date >= start.date())
+            and (end is None or total.date < end.date())
+        ]
         return window or complete[-1:]
 
     def render_compare(self) -> None:
@@ -683,42 +900,16 @@ class Octoscope(App):
         disagree about what a day used, and costs nothing in API calls however
         far back you step.
         """
-        frame = COMPARE_FRAMES[self.frame_index][1]
+        frame = self.time_range.frame
         comparison = costing.compare_periods(
             self.pool, frame, self.calibration, self.day_rates, self.night_rates,
             self.standing, offset=self.compare_offset)
         self.query_one("#compare", ComparePane).update_comparison(
             comparison, self.compare_metric)
-        # The hint names what the key would give you, not what is already on
-        # screen - the chart's own axis says which of the two that is.
-        other = "kWh" if self.compare_metric == "cost" else "cost"
         self.query_one("#compare-title", Label).update(
             f"┤ COMPARE · {comparison.current.label} vs {comparison.previous.label} ├"
-            f"   [dim](1-4 frame · g {other} · ←→ earlier · home now)[/dim]"
         )
-
-    def _step_compare(self, direction: int) -> None:
-        """Move the pair of periods back or forward; positive goes back.
-
-        Bounded by the data rather than by an arbitrary depth: stepping past the
-        oldest reading would draw two empty periods and look like a bug, so it
-        says why instead.
-        """
-        target = self.compare_offset + direction
-        if target < 0:
-            if self.compare_offset == 0:
-                self.log_line("[dim]already at the current period[/dim]")
-                return
-            target = 0
-        frame = COMPARE_FRAMES[self.frame_index][1]
-        earliest = costing.parse_time(self.pool[0]["interval_start"]) if self.pool else None
-        # The previous period is the one that would empty out first.
-        _, end = costing.period_window(frame, target + 1)
-        if earliest is not None and end <= earliest:
-            self.log_line(f"[yellow]no {frame} before that in the archive[/yellow]")
-            return
-        self.compare_offset = target
-        self.render_compare()
+        self.render_controls()
 
     def render_reconcile(self) -> None:
         """Check the Home Mini's record against settled billing.
@@ -778,64 +969,22 @@ class Octoscope(App):
         self.query_one("#month", MonthTile).update_month(forecast, kwh, standing_total)
         self.query_one("#forecast", ForecastTile).update_forecast(forecast)
 
-    async def render_table(self) -> None:
-        """Build the rollup table for the selected granularity.
+    def render_table(self) -> None:
+        """The chart's own buckets, as numbers.
 
-        Sub-hour rollups need per-minute telemetry from the Home Mini; 30
-        minutes and coarser come from settled consumption, which reaches much
-        further back.
+        Literally the same call the chart makes, so the table can no longer
+        disagree with the bars above it about what a day cost - which it could,
+        and did, while it kept a private granularity and no window at all. The
+        table's job is the exact figures, not a different question.
         """
-        period = list(ROLLUPS)[self.rollup_index]
-        table = self.query_one("#table", RollupTable)
-        point = self.point
-        if not point:
-            return
-
-        if period == "5min":
-            if not point.device_id:
-                self.query_one("#table-title", Label).update("┤ ROLLUP · 5 MIN ├  no home mini")
-                table.update_buckets([], period)
-                return
-            try:
-                with self.busy("5-min rollup"):
-                    readings = await self.client.telemetry(
-                        point.device_id, minutes=6 * 60, grouping="ONE_MINUTE",
-                        cache_ttl=TTL_TELEMETRY_TODAY,
-                        cache_key=f"minute-{point.device_id}")
-            except Exception as exc:  # noqa: BLE001
-                self.log_line(f"[red]5-min rollup:[/red] {exc}")
-                table.update_buckets([], period)
-                return
-            buckets = costing.rollup(
-                readings, period, self.calibration, self.day_rates, self.night_rates,
-                self.standing, start_key="readAt", value_key="consumptionDelta",
-                scale=0.001, interval_minutes=1.0)
-            source = "home mini · last 6h"
-        else:
-            buckets = costing.rollup(
-                self.readings, period, self.calibration, self.day_rates,
-                self.night_rates, self.standing, interval_minutes=30.0)
-            source = "settled consumption"
-            if period in ("day", "month"):
-                # Today's settled share, so it can be swapped for live telemetry.
-                today_only = [
-                    r for r in self.readings
-                    if costing.same_local_day(r.get("interval_start"))
-                ]
-                settled_today = costing.rollup(
-                    today_only, "day", self.calibration, self.day_rates,
-                    self.night_rates, self.standing, interval_minutes=30.0)
-                buckets = costing.patch_today(
-                    buckets, self.today,
-                    settled_today[0] if settled_today else None, period)
-                source = "settled + live today"
-
-        label = ROLLUPS[period]
         self.query_one("#table-title", Label).update(
-            f"┤ ROLLUP · {label} ├   [dim]{source} · cost inc standing · "
-            f"1-5 to change · tab for chart[/dim]"
+            f"┤ ROLLUP · {self.range_label} · per {self.grain_unit} ├"
+            "   [dim]settled consumption, home mini for anything unbilled · "
+            "cost inc standing · finer than 30 min lives in the LIVE view[/dim]"
         )
-        table.update_buckets(buckets, period)
+        self.query_one("#table", RollupTable).update_buckets(
+            self._buckets(), self.grain)
+        self.render_controls()
 
     async def render_live(self) -> None:
         point = self.point
@@ -915,9 +1064,10 @@ class Octoscope(App):
         if budget.used and budget.resets_at:
             spent = f" · frees at {budget.resets_at.astimezone(UK):%H:%M}"
         title.update(
-            f"┤ LIVE · {label} ├   [dim]1-4 granularity · ←→ scroll · {position} · "
+            f"┤ LIVE · {label} ├   [dim]{position} · "
             f"API budget {budget.remaining}/{budget.per_hour}{spent}[/dim]"
         )
+        self.render_controls()
 
     def _until_next_poll(self) -> str | None:
         """Time to the next telemetry poll, or None before one is scheduled.
@@ -1048,17 +1198,24 @@ class Octoscope(App):
         )
 
     async def render_tariffs(self) -> None:
-        """Price the selected period on every comparable Octopus tariff."""
+        """Price the selected range on every comparable Octopus tariff."""
         point = self.point
         if not point or not self.readings:
             return
-        label, span = PERIODS[self.period_index]
-        cutoff = dt.datetime.now(dt.timezone.utc) - span if span else None
+        label = self.range_label
+        self.render_controls()
+        start, end = self.range_window
         readings = [
             r for r in self.readings
-            if cutoff is None or (r.get("interval_start") or "") >= cutoff.isoformat()
+            if (when := costing.parse_time(r.get("interval_start"))) is not None
+            and (start is None or when >= start)
+            and (end is None or when < end)
         ]
         if not readings:
+            self.query_one("#tariff-title", Label).update(
+                f"┤ TARIFFS · {label} ├   [dim]no settled readings in this "
+                f"range - try a longer one[/dim]"
+            )
             return
 
         self.query_one("#tariff-title", Label).update(
@@ -1090,7 +1247,7 @@ class Octoscope(App):
         kwh = results[0].kwh
         self.query_one("#tariff-title", Label).update(
             f"┤ TARIFFS · {label} ├   [dim]{kwh:.0f} kWh over {results[0].days} days · "
-            f"inc standing · ↑↓ to explain a row · 1-4 period[/dim]"
+            f"inc standing · ↑↓ to explain a row[/dim]"
         )
 
     async def on_data_table_row_highlighted(self, event) -> None:
@@ -1110,7 +1267,7 @@ class Octoscope(App):
         if current is None:
             pane.show_detail(None, "")
             return
-        label = PERIODS[self.period_index][0]
+        label = self.range_label
         if candidate.is_current:
             pane.show_detail(
                 costing.TariffDetail(
@@ -1280,6 +1437,9 @@ class Octoscope(App):
         for name, pane, _ in VIEWS:
             self.query_one(f"#{pane}").set_class(name != self.view, "hidden")
         self.focus_view()
+        # Ahead of the render, which may be a worker: the bar must never be
+        # left describing the view you just tabbed away from.
+        self.render_controls()
         self.refresh_view()
 
     def focus_view(self) -> None:
@@ -1295,9 +1455,7 @@ class Octoscope(App):
         if self.view == "chart":
             self.render_period()
         elif self.view == "table":
-            # Scoped to its own group: a bare exclusive=True would cancel the
-            # bootstrap worker still fetching rates and comparison data.
-            self.run_worker(self.render_table(), exclusive=True, group="view")
+            self.render_table()
         elif self.view == "compare":
             self.render_compare()
         elif self.view == "live":
@@ -1305,84 +1463,101 @@ class Octoscope(App):
             # in-flight fetch already charged against the budget.
             self.run_worker(self.render_live(), group="live")
         else:
+            # Scoped to its own group: a bare exclusive=True would cancel the
+            # bootstrap worker still fetching rates and comparison data.
             self.run_worker(self.render_tariffs(), exclusive=True, group="view")
 
-    def action_period(self, index: int) -> None:
-        if self.view == "table":
-            if index >= len(ROLLUPS):
-                return
-            self.rollup_index = index
-            self.run_worker(self.render_table(), exclusive=True, group="view")
-            return
+    def action_pick(self, index: int) -> None:
+        """Number keys: choose the stretch of time - or, in live, the trace.
+
+        The single place a number key is handled. Every history view reads the
+        same range afterwards, so switching views never moves you in time and
+        the answer to "what am I looking at?" is the same one everywhere.
+        """
         if self.view == "live":
             if index >= len(LIVE_ROLLUPS):
                 return
             self.live_rollup_index = index
             self.run_worker(self.render_live(), group="live")
             return
-        if self.view == "compare":
-            if index >= len(COMPARE_FRAMES):
-                return
-            self.frame_index = index
-            # Back to the period in progress: an offset counted in days means
-            # something quite different once the frame is months.
-            self.compare_offset = 0
-            self.render_compare()
+        if index >= len(RANGES) or index == self.range_index:
+            # Re-pressing the range you are on returns it to the present, which
+            # is the obvious meaning and saves reaching for `home`.
+            if index == self.range_index and self.range_offset:
+                self.range_offset = 0
+                self.refresh_view()
             return
-        if index >= len(PERIODS):
+        previous = self.grain
+        self.range_index = index
+        # Stepping is counted in the range's own units, so an offset carried
+        # from a range of a different length would land somewhere arbitrary.
+        self.range_offset = 0
+        self._fit_grain(previous)
+        self.refresh_view()
+        if self.view == "chart":
+            self.query_one("#trend", TrendChart).scroll_home()
+
+    def action_grain(self) -> None:
+        """Cycle how finely the selected range is sliced.
+
+        Only through the grains this range can be drawn at, so the key can
+        never land you on a month-wide bar across a single day. That the offer
+        changes with the range is the point - and the control bar shows which
+        grains are on offer rather than leaving you to press `g` and find out.
+        """
+        if self.view in ("compare", "live"):
+            self.log_line(
+                "[dim]grain is fixed here - " + (
+                    "the compare view slices by its frame (m plots cost)"
+                    if self.view == "compare"
+                    else "1-4 pick the live trace resolution") + "[/dim]")
             return
-        self.period_index = index
-        self._fit_grain()
-        if self.view == "tariffs":
-            self.run_worker(self.render_tariffs(), exclusive=True, group="view")
-        else:
-            self.render_period(reset_scroll=True)
+        grains = self.time_range.grains
+        current = grains.index(self.grain) if self.grain in grains else -1
+        self.grain = grains[(current + 1) % len(grains)]
+        self.refresh_view()
+        if self.view == "chart":
+            self.query_one("#trend", TrendChart).scroll_home()
+
+    def action_metric(self) -> None:
+        """Compare view: plot cost instead of kWh, and back."""
+        if self.view != "compare":
+            return
+        self.compare_metric = "cost" if self.compare_metric == "kwh" else "kwh"
+        self.render_compare()
 
     async def action_refresh(self) -> None:
         self.log_line("[dim]manual refresh[/dim]")
         await self.refresh_consumption()
         await self.refresh_telemetry()
 
-    # Roughly how long each grain's bucket is, for deciding whether a period
-    # can sensibly be drawn at it.
-    _GRAIN_SPAN = {
-        "30min": dt.timedelta(minutes=30),
-        "60min": dt.timedelta(hours=1),
-        "6hr": dt.timedelta(hours=6),
-        "12hr": dt.timedelta(hours=12),
-        "day": dt.timedelta(days=1),
-        "week": dt.timedelta(days=7),
-        "month": dt.timedelta(days=30),
-    }
-    _MIN_BARS = 4
+    def _step_range(self, direction: int) -> None:
+        """Move the selected range earlier or later; positive goes earlier.
 
-    def _fit_grain(self) -> None:
-        """Step to a finer grain if the new period would be a couple of bars.
-
-        Picking 12 HOURS while the chart is on MONTH would otherwise draw a
-        single block. Only ever refines, and only on a period change - cycling
-        `g` afterwards still goes wherever you send it.
+        Bounded by the data rather than by an arbitrary depth: stepping past the
+        oldest reading would draw an empty range and look like a bug, so it says
+        why instead.
         """
-        span = PERIODS[self.period_index][1]
-        if span is None:
+        selected = self.time_range
+        if selected.unbounded:
+            self.log_line("[dim]ALL already covers everything there is[/dim]")
             return
-        while self.grain_index > 0:
-            bucket = self._GRAIN_SPAN[GRAINS[self.grain_index][1]]
-            if span >= bucket * self._MIN_BARS:
-                return
-            self.grain_index -= 1
-
-    def action_grain(self) -> None:
-        """Cycle the chart's granularity, coarsest-to-finest and round again."""
-        if self.view == "compare":
-            # The compare view's grain is fixed by the frame - a day is read in
-            # hours, a year in months - so the key swaps what is plotted
-            # instead. Same idea: it changes what the bars mean.
-            self.compare_metric = "cost" if self.compare_metric == "kwh" else "kwh"
-            self.render_compare()
+        target = self.range_offset + direction
+        if target < 0:
+            self.log_line("[dim]already at the present[/dim]")
             return
-        self.grain_index = (self.grain_index + 1) % len(GRAINS)
-        self.render_period(reset_scroll=True)
+        earliest = (
+            costing.parse_time(self.pool[0]["interval_start"]) if self.pool else None
+        )
+        # The compare view draws the period before this one too, so it is that
+        # one which would empty out first.
+        probe = target + 1 if self.view == "compare" else target
+        _, end = selected.window(probe)
+        if earliest is not None and end is not None and end <= earliest:
+            self.log_line("[yellow]nothing that far back in the archive[/yellow]")
+            return
+        self.range_offset = target
+        self.refresh_view()
 
     def action_toggle_reconcile(self) -> None:
         """Overlay the home mini against settled billing, and back."""
@@ -1405,49 +1580,50 @@ class Octoscope(App):
         self.query_one("#spike-pane").set_class(showing_log, "hidden")
 
     def action_scrub(self, direction: int) -> None:
-        """Pan the window back or forward by half its width.
+        """←/→: move through time by one of whatever is selected.
 
-        Same keys on both scrollable charts. The live view moves a time window
-        and may fetch; the trend chart moves over data already in hand, so it
-        is purely local.
+        One meaning everywhere. On a history view that is the range itself - the
+        previous day, the previous week - which is the step someone reaching for
+        the left arrow is asking for. The live view has no range to step, so
+        there it pans the trace window instead, by half a screen.
         """
-        if self.view == "chart":
-            self._scroll_trend(direction, page=True)
+        if self.view == "live":
+            _, _, _, minutes, _ = LIVE_ROLLUPS[self.live_rollup_index]
+            self._shift_window(dt.timedelta(minutes=minutes / 2) * direction)
             return
-        if self.view == "compare":
-            # A whole frame at a time either way: the pair being compared has to
-            # stay adjacent, so there is no half step to take.
-            self._step_compare(direction)
-            return
-        _, _, _, minutes, _ = LIVE_ROLLUPS[self.live_rollup_index]
-        self._shift_window(dt.timedelta(minutes=minutes / 2) * direction)
+        self._step_range(direction)
 
     def action_nudge(self, direction: int) -> None:
-        """Step by a single bucket, for lining the window up on an event."""
-        if self.view == "chart":
-            self._scroll_trend(direction, page=False)
-            return
-        if self.view == "compare":
-            self._step_compare(direction)
-            return
-        _, seconds, _, _, _ = LIVE_ROLLUPS[self.live_rollup_index]
-        self._shift_window(dt.timedelta(seconds=seconds) * direction)
+        """Shift+←/→: scroll within what is selected rather than moving it.
 
-    def _scroll_trend(self, direction: int, page: bool) -> None:
+        A range wider than the screen - ninety days of half-hours - still has to
+        be scrollable, but that is panning the viewport, not changing the
+        question, so it gets the modified key.
+        """
+        if self.view == "live":
+            _, seconds, _, _, _ = LIVE_ROLLUPS[self.live_rollup_index]
+            self._shift_window(dt.timedelta(seconds=seconds) * direction)
+            return
+        if self.view == "chart":
+            self._scroll_trend(direction)
+            return
+        self._step_range(direction)
+
+    def _scroll_trend(self, direction: int) -> None:
         """Scroll the trend chart; `direction` is positive for back in time."""
         if self.reconciling:
             return
         chart = self.query_one("#trend", TrendChart)
-        step = chart.page if page else 1
-        if chart.scroll_columns(step * direction):
+        if chart.scroll_columns(chart.page * direction):
             return
         if chart.max_column_offset == 0:
-            self.log_line("[dim]the whole period already fits on screen[/dim]")
-        elif direction > 0:
-            grain = GRAINS[self.grain_index][0].lower()
             self.log_line(
-                f"[yellow]start of the selected period - 1-4 for more "
-                f"history, or a coarser grain than {grain}[/yellow]")
+                "[dim]the whole range already fits - ←→ to step to the one "
+                "before it[/dim]")
+        elif direction > 0:
+            self.log_line(
+                f"[yellow]start of {self.range_label} - ← for the range before "
+                f"it, or a grain coarser than {self.grain_label.lower()}[/yellow]")
         else:
             self.log_line("[dim]already at the latest data[/dim]")
 
@@ -1473,18 +1649,17 @@ class Octoscope(App):
         self.run_worker(self.render_live(), group="live")
 
     def action_scrub_now(self) -> None:
-        if self.view == "chart":
-            if not self.reconciling:
-                self.query_one("#trend", TrendChart).scroll_home()
+        """home: back to the present, whatever "back" means here."""
+        if self.view == "live":
+            self.live_offset = dt.timedelta(0)
+            # Not exclusive: cancelling a live render would abandon an in-flight
+            # telemetry fetch that has already been charged against the budget.
+            self.run_worker(self.render_live(), group="live")
             return
-        if self.view == "compare":
-            self.compare_offset = 0
-            self.render_compare()
-            return
-        self.live_offset = dt.timedelta(0)
-        # Not exclusive: cancelling a live render would abandon an in-flight
-        # telemetry fetch that has already been charged against the budget.
-        self.run_worker(self.render_live(), group="live")
+        self.range_offset = 0
+        self.refresh_view()
+        if self.view == "chart" and not self.reconciling:
+            self.query_one("#trend", TrendChart).scroll_home()
 
     def log_line(self, message: str) -> None:
         stamp = dt.datetime.now(UK).strftime("%H:%M:%S")

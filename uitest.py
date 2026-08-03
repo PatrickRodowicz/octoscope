@@ -14,7 +14,7 @@ import datetime as dt
 import time
 
 from octoscope import api
-from octoscope.app import COMPARE_FRAMES, GRAINS, Octoscope
+from octoscope.app import GRAINS, RANGES, Octoscope
 
 calls: dict[str, int] = {}
 failures: list[str] = []
@@ -153,36 +153,70 @@ async def main() -> int:
               app._next_poll > before, True)
         app.paused = False
 
-        print("\n=== chart grains ===")
-        # Back to the chart: `1`-`6` mean the live granularity on the live view.
+        print("\n=== ranges and grains ===")
+        # The number keys mean the same thing on every view but live, so this
+        # section is really testing the whole dashboard's controls at once.
         while app.view != "chart":
             await pilot.press("tab")
             await pilot.pause()
         check("on the chart view", app.view, "chart")
-        seen = []
-        for _ in range(len(GRAINS)):
-            await pilot.press("g")
-            await pilot.pause()
-            seen.append(GRAINS[app.grain_index][0])
-        check("g cycles every grain exactly once",
-              sorted(seen), sorted(g[0] for g in GRAINS))
-        check("6 and 12 hour sit between hour and day",
-              [g[0] for g in GRAINS],
-              ["30 MIN", "HOUR", "6 HOUR", "12 HOUR", "DAY", "WEEK", "MONTH"])
+        check("6 and 12 hour sit between hour and day", list(GRAINS),
+              ["30min", "60min", "6hr", "12hr", "day", "week", "month"])
 
-        while GRAINS[app.grain_index][0] != "6 HOUR":
-            await pilot.press("g")
-            await pilot.pause()
-        check("chart titles the grain",
-              "6 HOUR" in str(app.query_one("#trend-title").content), True)
-        check("and names its unit", app.query_one("#trend").unit, "6-hour block")
-
-        # Refining on a period change has to keep working now that there are
-        # two more grains for it to walk past.
-        await pilot.press("1")  # 12 HOURS
+        await pilot.press("1")
         await pilot.pause()
-        check("12 HOURS refines a 6 HOUR chart to HOUR",
-              GRAINS[app.grain_index][0], "HOUR")
+        check("1 is today, not a rolling 24 hours", app.time_range.key, "today")
+        check("and the title says so",
+              "TODAY" in str(app.query_one("#trend-title").content), True)
+        await pilot.press("3")
+        await pilot.pause()
+        check("3 is this week", app.time_range.key, "week")
+        check("which starts on a Monday", app.range_window[0].weekday(), 0)
+
+        seen = []
+        for _ in range(len(app.time_range.grains)):
+            await pilot.press("g")
+            await pilot.pause()
+            seen.append(app.grain)
+        check("g cycles this range's grains exactly once",
+              sorted(seen), sorted(app.time_range.grains))
+        check("and never offers one the range cannot be drawn at",
+              all(g in app.time_range.grains for g in seen), True)
+
+        while app.grain != "6hr":
+            await pilot.press("g")
+            await pilot.pause()
+        check("chart names the unit it is sliced into",
+              "per 6-hour block" in str(app.query_one("#trend-title").content), True)
+        check("and the chart agrees", app.query_one("#trend").unit, "6-hour block")
+
+        # A range too short for the current grain has to move it, and to the
+        # nearest thing that still works rather than all the way to a default.
+        await pilot.press("1")  # TODAY: 30 MIN / HOUR / 6 HOUR
+        await pilot.pause()
+        check("today keeps a 6-hour grain, which it can draw", app.grain, "6hr")
+        await pilot.press("9")  # ALL: DAY / WEEK / MONTH
+        await pilot.pause()
+        check("ALL cannot draw 6-hour blocks and moves to the nearest",
+              app.grain, "day")
+
+        print("\n=== stepping back through time ===")
+        await pilot.press("3")  # THIS WEEK
+        await pilot.pause()
+        check("a fresh range starts at the present", app.range_offset, 0)
+        await pilot.press("left")
+        await pilot.pause()
+        check("← steps a whole week back", app.range_offset, 1)
+        check("and the title renames itself",
+              "LAST WEEK" in str(app.query_one("#trend-title").content), True)
+        await pilot.press("right")
+        await pilot.press("right")
+        await pilot.pause()
+        check("→ comes forward and stops at the present", app.range_offset, 0)
+        await pilot.press("left")
+        await pilot.press("home")
+        await pilot.pause()
+        check("home returns to now", app.range_offset, 0)
 
         print("\n=== comparing periods ===")
         # Every figure here comes out of the reading pool already in memory, so
@@ -197,46 +231,75 @@ async def main() -> int:
         def heading() -> str:
             return str(app.query_one("#compare-title").content)
 
-        check("it opens on today vs yesterday",
+        # The compare view reads the same range as everything else, so the key
+        # that means "today" on the chart means "today vs yesterday" here.
+        await pilot.press("1")
+        await pilot.pause()
+        check("1 compares today with yesterday",
               "TODAY vs YESTERDAY" in heading(), True)
-        for key, frame in (("2", "WEEK"), ("3", "MONTH"), ("4", "YEAR")):
+        for key, frame in (("3", "week"), ("4", "month"), ("9", "year")):
             await pilot.press(key)
             await pilot.pause()
-            check(f"{key} selects the {frame.lower()} frame",
-                  COMPARE_FRAMES[app.frame_index][0], frame)
+            check(f"{key} reads the range as a {frame}", app.time_range.frame, frame)
         check("and says which two periods it is showing",
               "THIS YEAR vs LAST YEAR" in heading(), True)
 
-        await pilot.press("g")
+        await pilot.press("m")
         await pilot.pause()
-        check("g plots cost instead of kWh", app.compare_metric, "cost")
-        check("and the hint says how to get back", "g kWh" in heading(), True)
-        await pilot.press("g")
+        check("m plots cost instead of kWh", app.compare_metric, "cost")
+        await pilot.press("m")
         await pilot.pause()
         check("and back again", app.compare_metric, "kwh")
 
+        await pilot.press("2")  # YESTERDAY
+        await pilot.pause()
+        check("yesterday is simply the day frame, one step back",
+              app.compare_offset, 1)
+        check("which moves both halves along", "YESTERDAY vs" in heading(), True)
         await pilot.press("1")
         await pilot.pause()
-        await pilot.press("left")
-        await pilot.pause()
-        check("← steps back a whole period", app.compare_offset, 1)
-        check("which moves both halves along",
-              "YESTERDAY vs SAT" in heading() or "YESTERDAY vs" in heading(), True)
-        await pilot.press("2")
-        await pilot.pause()
-        check("changing frame returns to the period in progress",
+        check("and today comes back to the period in progress",
               app.compare_offset, 0)
 
         await pilot.press("left")
         await pilot.press("left")
         await pilot.pause()
-        check("and it keeps stepping", app.compare_offset, 2)
+        check("← keeps stepping", app.compare_offset, 2)
         await pilot.press("home")
         await pilot.pause()
         check("home comes back to now", app.compare_offset, 0)
         await pilot.press("right")
         await pilot.pause()
         check("right at the present stays put", app.compare_offset, 0)
+
+        print("\n=== the control bar ===")
+        bar = app.query_one("#controls")
+
+        def controls() -> str:
+            return str(bar.content)
+
+        check("it offers every range", [o[1] for o in bar.options],
+              [r.label for r in RANGES])
+        check("and one number key each", [o[0] for o in bar.options],
+              [str((i + 1) % 10) for i in range(len(RANGES))])
+        # Narrow terminals fall back to the abbreviations rather than clipping
+        # the tail of the picker off - which is exactly where ALL lives.
+        check("nothing is cut off when it will not fit",
+              all(r.brief in controls() or r.label in controls() for r in RANGES), True)
+        check("and hides the grain picker where grain does nothing",
+              bar.secondary, [])
+        while app.view != "chart":
+            await pilot.press("tab")
+            await pilot.pause()
+        check("the chart gets one", len(bar.secondary) > 0, True)
+        check("showing only the grains this range allows",
+              len(bar.secondary), len(app.time_range.grains))
+        while app.view != "live":
+            await pilot.press("tab")
+            await pilot.pause()
+        check("and live says it is not a time range at all",
+              "resolution" in bar.note, True)
+        check("with its own four options", len(bar.options), 4)
 
         check("none of it called out", sum(calls.values()), 0)
 

@@ -11,29 +11,60 @@ and a projected monthly bill.
 | Key | Action |
 | --- | --- |
 | `tab` | cycle views: **chart → compare → table → live → tariffs** |
+| `1`–`9` | pick the **time range** — see below · live view: trace resolution |
+| `g` | pick the **grain** the range is sliced into |
+| `←` `→` | step the range earlier / later — the previous day, week, month… |
+| `home` | back to the present |
+| `shift`+`←` `→` | scroll *within* the range, when it is wider than the screen |
 | `↑` `↓` | table/tariffs: move the cursor — on TARIFFS this picks the comparison |
-| `1`–`5` | chart/tariffs: 7d / 30d / 90d / all · compare: day / week / month / year · table: 5min / 30min / 60min / day / month · live: granularity |
-| `g` | chart: granularity · compare: swap kWh for cost |
-| `←` `→` | live view: pan history by half a window · compare: step back a whole period |
-| `shift`+`←` `→` | live view: step one bucket at a time |
-| `home` | live/compare view: jump back to now |
+| `m` | compare view: swap kWh for cost |
+| `o` | chart view: overlay settled billing against the Home Mini |
 | `r` | force refresh |
 | `p` | pause/resume background polling — see [Stepping away](#stepping-away) |
 | `l` | swap the spikes pane for the event log |
 | `q` | quit |
 
+## Range and grain
+
+Two controls, and they mean the same thing on every view: a **range** is which
+stretch of time you are looking at, a **grain** is how finely it is sliced.
+
+```
+ 1 TODAY  2 YESTERDAY  3 THIS WEEK  4 THIS MONTH │ 5 LAST 24 HOURS  6 LAST 7 DAYS  7 LAST 30 DAYS  8 LAST 90 DAYS │ 9 ALL │ g 6 HOUR  12 HOUR  DAY  WEEK
+```
+
+That row sits above the panes at all times and is the authority on what the
+number keys will do — including on the live view, which relabels it, being the
+one view about the present moment rather than a stretch of history. The active
+option is highlighted, so "what am I looking at?" is answered by looking.
+
+`1`–`4` are **calendar** ranges: today is today, this week starts on Monday.
+`5`–`8` are **rolling** windows ending now, which is a genuinely different
+question — worth its own key rather than being approximated by the nearest
+calendar period. `9` is everything on record.
+
+Grain is offered **per range**. A range names the grains it can sensibly be
+drawn at and `g` cycles through those, so there is no month-wide bar across a
+single day and no four thousand half-hour columns across a year. Switching
+range keeps the closest grain to the one you were on rather than resetting.
+
+Ranges step. `←` moves to the week before, the month before, the day before;
+`home` returns to the present, and pressing the range's own number key again
+does the same. The chart, table, compare and tariffs views all read this one
+selection, so switching view keeps you where you were in time.
+
 ## The five views
 
 **CHART** — usage bars (day/night stacked) with a separate cost chart and its
-own money axis. Window (`1`–`6`) and granularity (`g`) are chosen
-independently, and the chart scrolls.
+own money axis, at the selected range and grain.
 
-**COMPARE** — one period against the one before it: today vs yesterday, this
-week vs last, this month vs last, this year vs last (`1`–`4`). The period in
-progress is compared against the previous one measured to the same point in
-itself, so the change is like for like all day rather than only at midnight.
+**COMPARE** — the selected range against the one before it: today vs yesterday,
+this week vs last, this month vs last. The period in progress is compared
+against the previous one measured to the same point in itself, so the change is
+like for like all day rather than only at midnight. `m` swaps kWh for cost.
 
-**TABLE** — rollups at 5 / 30 / 60 minutes, day, month.
+**TABLE** — the chart's own buckets as exact figures, at the same range and
+grain. Finer than 30 minutes is live telemetry, which is the LIVE view.
 
 **LIVE** — current draw as a large readout, cost per hour at that draw, and a
 power trace with a real clock axis. Keys `1`–`4` change granularity and window
@@ -127,17 +158,16 @@ never alters what the house is drawing right now.
 | FORECAST | What is this month's bill likely to come to? |
 
 **Middle — the trend.** Usage as stacked columns (blue = night register, green =
-day), a cost trace beneath, and totals/mean/peak for the selected period.
-Timeframe and granularity are chosen independently — see below.
+day), a cost trace beneath, and totals/mean/peak for the selected range.
 
-### Timeframe and granularity
+### Range and grain
 
-Two separate axes, and both matter:
+Two axes, and both matter:
 
 | Key | Controls | Options |
 | --- | --- | --- |
-| `1`–`6` | how much history | 12 hours, 24 hours, 7 days, 30 days, 90 days, all |
-| `g` | how finely it is sliced | 30 min, hour, 6 hour, 12 hour, day, week, month |
+| `1`–`9` | which stretch of time | today, yesterday, this week, this month · last 24 hours, 7 / 30 / 90 days · all |
+| `g` | how finely it is sliced | 30 min, hour, 6 hour, 12 hour, day, week, month — whichever the range allows |
 
 **6 hour and 12 hour** exist because the step from HOUR to DAY was a cliff: a
 month at HOUR is 720 bars you have to scroll through, and the same month at DAY
@@ -152,14 +182,24 @@ as the two registers.
 They cost nothing to add. Settled data is half-hourly, so these are sums of
 records already on disk; no new call fetches them.
 
-A period is a **window ending now**, not a count of complete days — which is
-what makes 12 and 24 hours expressible at all, since the last day is mostly
-unsettled and gets filled from the Home Mini.
+Ranges come in two kinds, because the two answer different questions. A
+**calendar** range snaps to real boundaries — TODAY is midnight to now, THIS
+WEEK starts on Monday — which is what people mean when they ask. A **rolling**
+range is a window ending now, which is the right shape for "how have the last
+24 hours gone" and is only expressible because the unsettled tail is filled
+from the Home Mini.
 
-Picking a short period steps the grain finer if the current one would draw
-fewer than four bars (12 HOURS while on MONTH becomes 12 HOURS · HOUR). It only
-ever refines, and only on a period change — `g` afterwards goes wherever you
-send it.
+Grain is not free-running: each range names the grains it can be drawn at, and
+`g` only offers those. TODAY goes down to half-hours and no coarser than
+6-hour blocks; ALL goes day, week, month. Changing range keeps the nearest
+grain to the one you had rather than snapping to a default, so stepping from
+LAST 7 DAYS to LAST 30 DAYS at 6 HOUR stays at 6 HOUR.
+
+This replaced a rule that inferred a grain from a rolling window only when the
+window would have drawn fewer than four bars — which meant the relationship
+between the two controls held sometimes, in one direction, and only on one of
+the five views. The control bar showing which grains are on offer is half the
+fix; the other half is that there is now one selection behind every view.
 
 ### One pool, so the totals cannot drift
 
@@ -210,18 +250,19 @@ those hours, and at DAY granularity you cannot see it.
 ### Scrolling
 
 Sub-day grains generate more bars than a terminal has columns — 30 days at 30
-MIN is 1,440 — so the chart scrolls, using the same keys as the live view:
+MIN is 1,440 — so the chart scrolls. Scrolling pans the viewport within the
+range; it does not change what is selected, which is why it is the modified key:
 
 | Key | Does |
 | --- | --- |
-| `←` / `→` | back / forward half a screen |
-| `shift+←` / `shift+→` | one bar at a time |
+| `shift+←` / `shift+→` | pan back / forward half a screen |
+| `←` / `→` | step to the range before / after this one |
 | `home` | jump back to the latest data |
 
 The visible span is always spelled out beneath the chart:
 
 ```
-showing  11/07 19:00 → 17/07 21:00  (147 of 720 hours, totals above cover all of them)   ← → scroll   home = latest
+showing  11/07 19:00 → 17/07 21:00  (147 of 720 hours, totals above cover all of them)   shift+← → scroll   home = latest
 ```
 
 Unlike the live view, scrolling here **never fetches** — it pans over records
@@ -249,10 +290,14 @@ Economy 7, and a secondary tariff comparison pane.
 
 ## Compare view (`tab`)
 
-Usage across two adjacent periods of the same length. `1`–`4` pick the frame —
-day, week, month, year — and `←` `→` step the pair back and forward through
-history a whole period at a time, `home` returns to the present. `g` swaps the
-chart between kWh and money; the headline shows both either way.
+Usage across two adjacent periods of the same length. It reads the same range
+as every other view — `1` (TODAY) compares today with yesterday, `3` (THIS
+WEEK) this week with last, `9` (ALL) this year with last — and `←` `→` step the
+pair back through history a whole period at a time, `home` returns to the
+present. `m` swaps the chart between kWh and money; the headline shows both
+either way. Grain is fixed by the frame here (a day is read hour by hour, a
+year month by month), so the control bar shows no grain picker rather than
+offering one that does nothing.
 
 ```
 THIS WEEK                  51.72 kWh     £15.06   so far · day 7 of 7
@@ -307,10 +352,14 @@ history is free however far you go.
 
 ## Table view (`tab`)
 
-Rollups at 5 / 30 / 60 minutes, day, and month, with columns for period, usage,
-tariff register, and total cost. The 5-minute rollup comes from per-minute Home
-Mini telemetry (recent hours only); everything coarser comes from settled
-consumption, which reaches back months.
+The chart's own buckets as exact figures, with columns for period, usage,
+tariff register, and total cost — the same range and the same grain, from the
+same merged pool, so the table and the bars above it cannot disagree about what
+a day cost. It used to keep a private granularity and no window at all, which
+is precisely how they came to.
+
+Finer than 30 minutes is per-minute Home Mini telemetry rather than settled
+consumption, and that lives in the LIVE view.
 
 The **cost column is additive**: 30-minute rows sum exactly to their hour, hours
 to the day, days to the month. That requires apportioning the daily standing
